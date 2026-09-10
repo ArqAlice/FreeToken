@@ -162,6 +162,20 @@ class OffloadMoeCache:
             "(raise moe_cache_size or disable moe_prefill_overlap)"
         )
         self.cache_policy_id = policy_ids[self.cache_policy]
+        self.lrfu_half_life = int(os.environ.get("FREETOKEN_EXPERT_LRFU_HALF_LIFE", "0"))
+        if not 0 <= self.lrfu_half_life <= 4096:
+            raise ValueError("FREETOKEN_EXPERT_LRFU_HALF_LIFE must be between 0 and 4096")
+        self.layer_distance_penalty = float(os.environ.get("FREETOKEN_EXPERT_LAYER_DISTANCE", "0"))
+        if not math.isfinite(self.layer_distance_penalty) or not 0 <= self.layer_distance_penalty <= 16:
+            raise ValueError("FREETOKEN_EXPERT_LAYER_DISTANCE must be finite and between 0 and 16")
+        if self.layer_distance_penalty and not self.lrfu_half_life:
+            raise ValueError("FREETOKEN_EXPERT_LAYER_DISTANCE requires a positive LRFU half-life")
+        self.validate_rebuild(self.cache_size)
+        self.lrfu_frequency = (torch.zeros(self.num_layers * self.num_experts,
+                                          dtype=torch.float32, device=self.device)
+                               if self.lrfu_half_life else None)
+        self.lrfu_last = (torch.zeros_like(self.lrfu_frequency, dtype=torch.int64)
+                          if self.lrfu_half_life else None)
         self.slot_for_id = torch.full(
             (self.num_layers, self.num_experts),
             -1,
@@ -263,6 +277,11 @@ class OffloadMoeCache:
         # first 2 * num_experts slots (set up when prefill_overlap is enabled).
         self.prefill_bank_buffers: list[torch.Tensor] = []
         self.prefill_copy_stream: torch.cuda.Stream | None = None
+        self.decode_copy_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda" and os.environ.get("FREETOKEN_MTP_EXPERT_OVERLAP", "1") == "1"
+            else None
+        )
         self.prefill_begin_event: torch.cuda.Event | None = None
         self.prefill_ready_events: list[torch.cuda.Event] = []
         self.prefill_release_events: list[torch.cuda.Event] = []
@@ -432,6 +451,8 @@ class OffloadMoeCache:
         """
         if cache_size < self.num_experts:
             raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
+        if getattr(self, 'lrfu_half_life', 0) and cache_size >= 40000:
+            raise ValueError('experimental LRFU requires fewer than 40000 cache slots')
         if self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
             raise ValueError(
                 f"moe_cache_size={cache_size} exceeds the marlin backend's slot limit of "
@@ -483,6 +504,9 @@ class OffloadMoeCache:
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.step.zero_()
         self.active_mask.zero_()
+        if self.lrfu_frequency is not None:
+            self.lrfu_frequency.zero_()
+            self.lrfu_last.zero_()
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
@@ -819,6 +843,10 @@ class OffloadMoeCache:
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
+
+        if self.lrfu_half_life:
+            from freetoken.moe.offload_kernels import prepare_lrfu
+            prepare_lrfu(self, layer_id, expert_ids)
 
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to

@@ -21,18 +21,23 @@ def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> 
     return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
 
 
-def sample_impl(
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    top_k: torch.Tensor | int | None,
-    top_p: torch.Tensor | float | None,
-) -> torch.Tensor:
+def _sampling_backend():
     from freetoken.kernel.backend import is_flashinfer_installed
 
     if is_flashinfer_installed():
         import flashinfer.sampling as sampling
     else:
         import freetoken.kernel.triton.sampling as sampling
+    return sampling
+
+
+def sample_impl(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor | int | None,
+    top_p: torch.Tensor | float | None,
+) -> torch.Tensor:
+    sampling = _sampling_backend()
 
     probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
     if top_k is None and top_p is None:
@@ -54,6 +59,33 @@ def sample_impl(
 class Sampler:
     device: torch.device
     vocab_size: int
+
+    def probabilities(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
+        if args.temperatures is None:
+            return torch.zeros_like(logits, dtype=torch.float32).scatter_(
+                -1, logits.argmax(-1, keepdim=True), 1.)
+        sampling = _sampling_backend()
+
+        def expand(value):
+            if value is not None and value.numel() == 1:
+                return value.expand(logits.shape[0]).contiguous()
+            return value
+
+        probs = sampling.softmax(logits.float(), expand(args.temperatures), enable_pdl=is_sm90_supported())
+        if args.top_k is not None:
+            probs = sampling.top_k_renorm_probs(probs, expand(args.top_k))
+        if args.top_p is not None:
+            probs = sampling.top_p_renorm_probs(probs, expand(args.top_p))
+        return probs
+
+    def sample_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        return _sampling_backend().sampling_from_probs(probs.contiguous())
+
+    def sample_speculative(self, target: torch.Tensor, draft: torch.Tensor,
+                           accepted: torch.Tensor) -> torch.Tensor:
+        from freetoken.engine.speculative import verification_distribution
+
+        return self.sample_probs(verification_distribution(target, draft, accepted))
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]

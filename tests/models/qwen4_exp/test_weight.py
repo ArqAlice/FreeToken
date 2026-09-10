@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
+
 from safetensors.torch import save_file
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
@@ -21,6 +23,19 @@ from freetoken.models.qwen4_exp.weight import (
     load_ple_table,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
+
+
+def test_mtp_scale_fusion_uses_checkpoint_rows():
+    from freetoken.models.qwen4_exp.weight import _try_mtp_nvfp4_fuse
+
+    prefix = "mtp.layers.0.mlp.shared_expert."
+    rows = {prefix + "gate_proj": 7, prefix + "up_proj": 7}
+    pending = {}
+    assert _try_mtp_nvfp4_fuse(prefix + "gate_proj.weight_scale_2", torch.tensor(2.), pending, rows) == ()
+    name, value = _try_mtp_nvfp4_fuse(prefix + "up_proj.weight_scale_2", torch.tensor(3.), pending, rows)
+    assert name == prefix + "gate_up_proj.weight_global"
+    assert value.tolist() == [2.] * 7 + [3.] * 7
+    assert not pending
 
 H = 32  # hidden_size
 HC = 4  # hc_count
@@ -316,6 +331,21 @@ def test_load_ple_table_concatenates_shards_in_index_order(checkpoint):
                            raw[f"{prefix}.shard_{shard}.weight"].view(torch.uint8))
     assert table.weight_scale.dtype is torch.bfloat16
     assert float(table.weight_scale) == 0.125
+
+
+def test_load_ple_table_accepts_unscaled_bf16_shards(tmp_path):
+    prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+    first = torch.arange(12, dtype=torch.bfloat16).view(3, 4)
+    second = torch.arange(12, 24, dtype=torch.bfloat16).view(3, 4)
+    save_file(
+        {f"{prefix}.shard_0.weight": first, f"{prefix}.shard_1.weight": second},
+        str(tmp_path / "model-plebf16.safetensors"),
+    )
+    args = SimpleNamespace(split_ngram_parts=2, ngram_head_dim=4)
+    table = load_ple_table(str(tmp_path), args, pin=False)
+    assert table.tensor.dtype is torch.bfloat16
+    assert torch.equal(table.tensor, torch.cat((first, second)))
+    assert float(table.weight_scale) == 1.0
 
 
 def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):

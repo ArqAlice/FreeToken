@@ -50,7 +50,7 @@ def _gib(n_bytes: int) -> str:
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
     batch: Batch
-    sample_args: BatchSamplingArgs
+    sample_args: BatchSamplingArgs | None
     input_tuple: Indice2D  # (token_mapping, positions)
     write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
 
@@ -166,6 +166,8 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
+        if hasattr(self, "_mtp_runner"):
+            self._mtp_runner.close()
         self.engine.rebuild_runtime_cache(
             moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
             num_swa_pages=num_swa_pages,
@@ -283,7 +285,7 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.config.mtp_speculative_tokens:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -296,6 +298,8 @@ class Scheduler(SchedulerIOMixin):
 
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
+        if hasattr(self, "_mtp_runner"):
+            self._mtp_runner.close()
         self.sync_all_ranks()
         self.engine.shutdown()
 
@@ -303,7 +307,8 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, forward_output = last_data[0].batch, last_data[1]
+        next_tokens_cpu, copy_done = forward_output[1:3]
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
@@ -334,49 +339,56 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                finished = False
+                # Stop handling must visit each accepted token and the correction/bonus
+                # in order, including when they arrive in one speculative forward.
+                for token in next_tokens_cpu[i].reshape(-1):
+                    if token.item() < 0:
+                        continue
+                    req.append_host(token.reshape(1))
+                    next_token = int(token.item())
+                    # EOS / stop-string -> "stop", output budget exhausted -> "length";
+                    # EOS and stop strings win over length.
+                    hit_length = req.input_ids.numel() >= req.max_device_len
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                     )
-                )
+                    matched_stop = (
+                        self._match_stop_str(req)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        next_token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = req.input_ids.numel()
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=next_token,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
+                    if finished:
+                        # NOTE: overlap scheduling may make the request freed twice, skip second free
+                        if req not in self.finished_reqs:
+                            self.decode_manager.remove_req(req)
+                            self._free_req_resources(req)
+                            new_finished_reqs.add(req)
+                        break
 
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
+                if not finished and batch.is_prefill and req.table_idx != -1:
                     # for prefill, non-chunk req, cache the prefix.
                     # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
                     # the generic manager inserts the prefix into its radix/naive cache.
@@ -414,6 +426,7 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            generated_tokens=len(reply),
         )
         self.send_result(reply)
 
@@ -601,6 +614,8 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        if hasattr(self, "_mtp_runner"):
+            self._mtp_runner.forget(req.uid)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -759,7 +774,7 @@ class Scheduler(SchedulerIOMixin):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"could not log cache geometry: {e!r}")
 
-    def _prepare_batch(self, batch: Batch) -> ForwardInput:
+    def _prepare_batch(self, batch: Batch, *, allocate: bool = True, sample: bool = True) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
         if batch.is_decode:
@@ -777,7 +792,8 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
-        self.cache_manager.allocate_paged(batch.reqs)
+        if allocate:
+            self.cache_manager.allocate_paged(batch.reqs)
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
@@ -813,7 +829,7 @@ class Scheduler(SchedulerIOMixin):
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
+            sample_args=self.engine.sampler.prepare(batch) if sample else None,
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
@@ -864,6 +880,15 @@ class Scheduler(SchedulerIOMixin):
         self.send_result([ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids])
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
+        if self.config.mtp_speculative_tokens:
+            from .mtp import MTPRunner
+
+            if not hasattr(self, "_mtp_runner"):
+                self._mtp_runner = MTPRunner(self)
+            return self._mtp_runner.forward(forward_input)
+        return self._forward_standard(forward_input)
+
+    def _forward_standard(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:

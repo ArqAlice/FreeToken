@@ -1,0 +1,194 @@
+[
+  {
+    "shape": [
+      1,
+      8,
+      2560,
+      1024
+    ],
+    "routing": "shared",
+    "equal": true,
+    "lut_ms": 0.010450979992747307,
+    "arithmetic_ms": 0.008873451927493762
+  },
+  {
+    "shape": [
+      1,
+      8,
+      2560,
+      1024
+    ],
+    "routing": "spread",
+    "equal": true,
+    "lut_ms": 0.010412102670811895,
+    "arithmetic_ms": 0.008469563044034517
+  },
+  {
+    "shape": [
+      4,
+      8,
+      2560,
+      1024
+    ],
+    "routing": "shared",
+    "equal": true,
+    "lut_ms": 0.033338391902083056,
+    "arithmetic_ms": 0.026737546775841062
+  },
+  {
+    "shape": [
+      4,
+      8,
+      2560,
+      1024
+    ],
+    "routing": "spread",
+    "equal": true,
+    "lut_ms": 0.03418281245298412,
+    "arithmetic_ms": 0.02780594353203301
+  },
+  {
+    "shape": [
+      1,
+      8,
+      512,
+      2560
+    ],
+    "routing": "shared",
+    "equal": true,
+    "lut_ms": 0.005044272834855008,
+    "arithmetic_ms": 0.0044858821773220425
+  },
+  {
+    "shape": [
+      1,
+      8,
+      512,
+      2560
+    ],
+    "routing": "spread",
+    "equal": true,
+    "lut_ms": 0.005049539002150866,
+    "arithmetic_ms": 0.004497132871461951
+  },
+  {
+    "shape": [
+      4,
+      8,
+      512,
+      2560
+    ],
+    "routing": "shared",
+    "equal": true,
+    "lut_ms": 0.015909088788047115,
+    "arithmetic_ms": 0.014597539939428035
+  },
+  {
+    "shape": [
+      4,
+      8,
+      512,
+      2560
+    ],
+    "routing": "spread",
+    "equal": true,
+    "lut_ms": 0.016205079655817026,
+    "arithmetic_ms": 0.014257584925381194
+  },
+  {
+    "shape": [
+      1,
+      8,
+      2560,
+      3072
+    ],
+    "routing": "shared",
+    "equal": true,
+    "lut_ms": 0.026454819301594358,
+    "arithmetic_ms": 0.021361677470960114
+  },
+  {
+    "shape": [
+      1,
+      8,
+      2560,
+      3072
+    ],
+    "routing": "spread",
+    "equal": true,
+    "lut_ms": 0.025964584964060643,
+    "arithmetic_ms": 0.021113560523515866
+  },
+  {
+    "shape": [
+      4,
+      8,
+      2560,
+      3072
+    ],
+    "routing": "shared",
+    "equal": true,
+    "lut_ms": 0.10073001708217602,
+    "arithmetic_ms": 0.08502189967943274
+  },
+  {
+    "shape": [
+      4,
+      8,
+      2560,
+      3072
+    ],
+    "routing": "spread",
+    "equal": true,
+    "lut_ms": 0.101348591350136,
+    "arithmetic_ms": 0.08475164865192614
+  },
+  {
+    "shape": [
+      1,
+      8,
+      1536,
+      2560
+    ],
+    "routing": "shared",
+    "equal": true,
+    "lut_ms": 0.012904581284858812,
+    "arithmetic_ms": 0.010824130112206556
+  },
+  {
+    "shape": [
+      1,
+      8,
+      1536,
+      2560
+    ],
+    "routing": "spread",
+    "equal": true,
+    "lut_ms": 0.012834783951441447,
+    "arithmetic_ms": 0.010788975695827948
+  },
+  {
+    "shape": [
+      4,
+      8,
+      1536,
+      2560
+    ],
+    "routing": "shared",
+    "equal": true,
+    "lut_ms": 0.04571656106223523,
+    "arithmetic_ms": 0.040878513531807145
+  },
+  {
+    "shape": [
+      4,
+      8,
+      1536,
+      2560
+    ],
+    "routing": "spread",
+    "equal": true,
+    "lut_ms": 0.04685487304908642,
+    "arithmetic_ms": 0.04040124971572667
+  }
+]

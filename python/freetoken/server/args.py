@@ -317,6 +317,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mtp-speculative-tokens",
+        type=int,
+        default=ServerArgs.mtp_speculative_tokens,
+        help="Number of speculative draft tokens with the checkpoint MTP head (0 disables; 1-4).",
+    )
+    parser.add_argument("--mtp-auto", action="store_true", default=ServerArgs.mtp_auto,
+                        help="Select depth 0-3 per request from measured time per emitted token; requires MTP.")
+
+    parser.add_argument(
         "--num-tokenizer",
         "--tokenizer-count",
         type=int,

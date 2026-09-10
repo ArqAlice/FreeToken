@@ -1,0 +1,51 @@
+{
+  "branch": "feat/mtp-support",
+  "base_head": "3381015664c3acc5003b04fcad9a29742429792c",
+  "patch_reference": "Pre-turn runtime snapshot, including earlier uncommitted MTP work; not HEAD",
+  "checkpoint": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+  "revision": "18bd7d69491d4709ac1933e95343e15f045ea21d",
+  "versions": {
+    "torch": "2.11.0+cu130",
+    "triton": "3.6.0",
+    "transformers": "5.16.1"
+  },
+  "geometry": {
+    "max_seq_len": 1000128,
+    "pages": 15629,
+    "moe_slots": 3073,
+    "request_slots": 2,
+    "max_prefill_length": 8192,
+    "kv_dtype": "nvfp4",
+    "cache_type": "naive"
+  },
+  "runtime_changed": [
+    "python/freetoken/engine/config.py",
+    "python/freetoken/engine/engine.py",
+    "python/freetoken/engine/graph.py",
+    "python/freetoken/models/qwen4_exp/ple_disk.py",
+    "python/freetoken/scheduler/mtp.py",
+    "python/freetoken/scheduler/mtp_policy.py",
+    "python/freetoken/scheduler/scheduler.py",
+    "python/freetoken/server/args.py"
+  ],
+  "sha256": {
+    "python/freetoken/engine/config.py": "5e4613fee10d444cec14d8dc8c20074c1f425417a6c805966bea4378a9fb4189",
+    "python/freetoken/engine/engine.py": "c5ecd4f4a699023e4d64c496e92b1539ad5a3649f82b9b0555757d0448f15d12",
+    "python/freetoken/engine/graph.py": "23be344800cd14e85f79c0ac2700ba87375b12e84ed9974e2a79072645fb481f",
+    "python/freetoken/models/qwen4_exp/ple_disk.py": "1fe1ddcd91d4f59b8e1262240854b7262a351e32f6dfd5203631785024240f51",
+    "python/freetoken/scheduler/mtp.py": "2c2628cf6035419ec6ab1bb7641848d95275abfd69a4be11a9dbb1ae046fcbf5",
+    "python/freetoken/scheduler/mtp_policy.py": "c8a97b5eedd70803e3cb86dada1c884ee74e004d8103d32fba3dbe63b4ee8803",
+    "python/freetoken/scheduler/scheduler.py": "fd698641dd2d2d4c519d22e5b88a14b991a94d47a6a4af45c65765c105d914c1",
+    "python/freetoken/server/args.py": "daa1dd0e74a046eb9ed0b05840c24670d85e9c1d6a8097daa1f8c62f06dc0e8f",
+    "tests/scheduler/test_mtp.py": "393499b5bcdf5fbc32df8b630bacc09f6f26bdd93ab60085eec854e249869d52",
+    "tests/scheduler/test_cache_rebuild.py": "fe2ba0d6d3428ccaf62a47f659bceae9d8718b7f2ec84c430f27c88a9f04f31e",
+    "tests/engine/test_kv_quant_config.py": "2145b3acb6025b458225322646df9875c3f15cd3e3b4e99d67992aec5f3e2a35",
+    "tests/engine/test_speculative.py": "602dcc090d2ab3334315f8772ff419e9013bf0675757addb46e0d768667c0c9f",
+    "tests/models/qwen4_exp/test_ple_disk.py": "3f32aa65ceab275b89e619898f979b16b42ff4cc0577e3c413ca194ca741c613",
+    "tests/models/qwen4_exp/test_skeleton.py": "ac3161f570ca679917e40b0e1733345b05750c395a84867146050106b4028197",
+    "benchmarks/bench_mtp.py": "d40a2da087f3841db6490472e9a71e13e704f1a497f477e33f8cb4f3f062e9e4",
+    "benchmarks/bench_mtp_chat.py": "fd630c7f0ac3d2ca830051ffa961ba4095cedb1f17dc53950900e9542dd9d614",
+    "benchmarks/bench_mtp_http.py": "cb91f412ac6e38f556666b73e79a69ef51f63ab7735732e09416d6fd4f540fc2",
+    "benchmarks/bench_nvfp4_moe.py": "b14e3114ffb0b4fb433cf42c5d1c296ad592c1b376b17a97e07155320dba8be2"
+  }
+}

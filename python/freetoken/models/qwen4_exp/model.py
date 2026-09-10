@@ -15,11 +15,19 @@ immediate combine::
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
+from freetoken.layers import (
+    BaseOP,
+    GemmaPlusOneRMSNorm,
+    LinearReplicated,
+    OPList,
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
@@ -105,7 +113,10 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
-    def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, batch: Batch, *, return_residual: bool = False,
+        compute_output: bool = True,
+    ) -> torch.Tensor | None | tuple[torch.Tensor | None, torch.Tensor]:
         hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
         meta = None
         if self._ple:
@@ -120,13 +131,57 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        output = self.hyper_connection_mixer.mix(hidden)[0] if compute_output else None
+        return (output, hidden) if return_residual else output
+
+
+class Qwen4ExpMTP(BaseOP):
+    """The Qwen3.8 MTP head over the target model's hyper-connection residual state."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        args = config.qwen4_args
+        self.hc_count = args.hc_count
+        self.hidden_size = args.hidden_size
+        self.pre_fc_norm_embedding = GemmaPlusOneRMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = GemmaPlusOneRMSNorm(args.ple_state_width, config.rms_norm_eps)
+        self.fc_embedding = LinearReplicated(self.hidden_size, self.hidden_size, has_bias=False)
+        self.fc_hidden = LinearReplicated(self.hidden_size, self.hidden_size, has_bias=False)
+        first_layer = config.num_layers
+        mtp_config = replace(config, dense_quant=args.mtp_dense_quant)
+        self.layers = OPList(
+            [
+                Qwen4ExpDecoderLayer(mtp_config, first_layer + i)
+                for i in range(args.mtp_num_hidden_layers)
+            ]
+        )
+        self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
+
+    def forward(
+        self, embedding: torch.Tensor, target_residual: torch.Tensor, batch: Batch,
+        *, return_residual: bool = False, compute_output: bool = True,
+    ) -> torch.Tensor | None | tuple[torch.Tensor | None, torch.Tensor]:
+        embed = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(embedding))
+        hidden = self.pre_fc_norm_hidden.forward(target_residual)
+        hidden = self.fc_hidden.forward(hidden.view(-1, self.hidden_size)).view_as(hidden)
+        hidden = hidden.view(-1, self.hc_count, self.hidden_size)
+        hidden = (hidden + embed.unsqueeze(1)).flatten(1)
+        for layer in self.layers.op_list:
+            hidden = layer.forward(hidden, batch)
+        output = self.hyper_connection_mixer.mix(hidden)[0] if compute_output else None
+        return (output, hidden) if return_residual else output
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
+        self.mtp = (
+            Qwen4ExpMTP(config)
+            if config.qwen4_args.mtp_num_hidden_layers
+            else None
+        )
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
 
@@ -142,6 +197,23 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+
+        if self.mtp is not None:
+            from freetoken.layers.linear import _LinearTPImpl
+            from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseLinear
+
+            def mark(op):
+                if isinstance(op, (_LinearTPImpl, Nvfp4DenseLinear)):
+                    op._mtp_rowwise = True
+                for value in vars(op).values():
+                    if isinstance(value, BaseOP):
+                        mark(value)
+                    elif isinstance(value, list):
+                        for child in value:
+                            if isinstance(child, BaseOP):
+                                mark(child)
+
+            mark(self.model)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
@@ -213,5 +285,24 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         batch = get_global_ctx().batch
         return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
 
+    def forward_with_target_residual(
+        self, *, all_tokens: bool = False, compute_logits: bool = True
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        batch = get_global_ctx().batch
+        output, residual = self.model.forward(batch.input_ids, batch, return_residual=True,
+                                              compute_output=compute_logits)
+        return (self.lm_head.forward(output, all_tokens=all_tokens) if compute_logits else None), residual
 
-__all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]
+    def forward_mtp(
+        self, input_ids: torch.Tensor, target_residual: torch.Tensor, batch: Batch,
+        *, return_residual: bool = False, compute_logits: bool = True,
+    ) -> torch.Tensor | None | tuple[torch.Tensor | None, torch.Tensor]:
+        assert self.mtp is not None, "checkpoint has no MTP head"
+        embedding = self.model.embed_tokens.forward(input_ids)
+        output, residual = self.mtp.forward(embedding, target_residual, batch, return_residual=True,
+                                           compute_output=compute_logits)
+        logits = self.lm_head.forward(output) if compute_logits else None
+        return (logits, residual) if return_residual else logits
+
+
+__all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "Qwen4ExpMTP", "build_linear_mixer"]

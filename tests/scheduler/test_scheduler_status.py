@@ -137,6 +137,63 @@ def test_decode_counter_resets_each_interval():
     assert "gen throughput (token/s): 3.00" in logs[-1]
 
 
+def test_decode_throughput_counts_emitted_tokens_including_zero():
+    rep, logs, clock = _reporter(interval=3)
+    for second, emitted in enumerate((4, 0, 5), start=1):
+        clock["t"] = float(second)
+        rep.report_batch(
+            _decode_batch(2), running_reqs=2, queue_reqs=0,
+            kv_used_pages=1, kv_total_pages=10, page_size=1, generated_tokens=emitted,
+        )
+    assert len(logs) == 1
+    assert "gen throughput (token/s): 3.00" in logs[0]
+
+
+def test_scheduler_throughput_counts_only_delivered_tokens():
+    from contextlib import nullcontext
+
+    import torch
+
+    from freetoken.core import Batch, Req, SamplingParams
+    from freetoken.scheduler.scheduler import Scheduler
+
+    rep, logs, clock = _reporter(interval=1)
+    reqs = [
+        Req(input_ids=torch.tensor([1, 2]), table_idx=i, cached_len=1, output_len=10,
+            uid=i, sampling_params=SamplingParams(), cache_handle=None)
+        for i in range(4)
+    ]
+    reqs[1].aborted = True
+    running = set(reqs)
+    replies = []
+    scheduler = SimpleNamespace(
+        cache_manager=SimpleNamespace(lazy_free_region=nullcontext),
+        decode_manager=SimpleNamespace(running_reqs=running, remove_req=running.discard),
+        prefill_manager=SimpleNamespace(pending_list=[]),
+        finished_reqs={reqs[2]},
+        eos_token_ids={13}, toolcall_anchor_id=None,
+        config=SimpleNamespace(page_size=64), status_reporter=rep,
+        _free_req_resources=lambda req: None,
+        _kv_usage_pages=lambda: (1, 10), _mamba_slot_usage=lambda: None,
+        _swa_token_usage=lambda: None, _gpu_mem_bytes=lambda: 0,
+        send_result=replies.extend,
+    )
+    tokens = torch.tensor([
+        [10, 11, 13, 14],
+        [20, 21, 22, 23],
+        [25, 26, 27, 28],
+        [30, 31, 32, -1],
+    ])
+    clock["t"] = 1.0
+    Scheduler._process_last_data(
+        scheduler,
+        (SimpleNamespace(batch=Batch(reqs, "decode")),
+         (None, tokens, SimpleNamespace(synchronize=lambda: None))),
+    )
+    assert [reply.next_token for reply in replies] == [10, 11, 13, 30, 31, 32]
+    assert "gen throughput (token/s): 6.00" in logs[-1]
+
+
 def test_zero_gap_and_zero_total_are_guarded():
     rep, logs, clock = _reporter(interval=1)
     # gap == 0 (clock unchanged since construction) and total == 0 must not raise

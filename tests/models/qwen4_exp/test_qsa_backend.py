@@ -23,6 +23,132 @@ from .common import Fixture, requires_cuda, parsed_config, selection_spy
 QSA_LAYER = 3
 
 
+@pytest.mark.parametrize(
+    ("length", "expected_pages"),
+    [(0, 128), (64, 128), (8192, 128), (8193, 256), (16385, 512), (1000128, 15627)],
+)
+def test_active_page_table_buckets(length, expected_pages):
+    from freetoken.attention.qsa_sparse import QSASparseAttnBackend
+
+    backend = object.__new__(QSASparseAttnBackend)
+    backend.page_size = 64
+    backend._block_topk_kernel = object()
+    pages = torch.arange(3 * 15627, dtype=torch.int32).reshape(3, 15627) * 64
+    backend._block_base_view = lambda: pages
+    table_idx = torch.tensor([2, 0], dtype=torch.int64)
+    actual = backend._block_table(table_idx, length)
+    assert actual.shape == (2, expected_pages)
+    assert torch.equal(actual, pages[table_idx, :expected_pages] // 64)
+    assert backend._block_table(table_idx).shape == (2, 15627)
+    backend._block_topk_kernel = None
+    assert backend._block_table(table_idx, length).shape == (2, 15627)
+
+
+@pytest.mark.parametrize("name", ["logits", "topk_scratch"])
+def test_active_score_workspace_reuses_capacity(name):
+    from freetoken.attention.qsa_sparse import QSASparseAttnBackend
+
+    backend = object.__new__(QSASparseAttnBackend)
+    buffer = torch.empty((4, 4096), dtype=torch.float32)
+    backend._graph = {name: buffer}
+    actual = backend._scratch(name, 2, 512, dtype=buffer.dtype)
+    assert actual.shape == (2, 512)
+    assert actual.stride() == (4096, 1)
+    assert actual.data_ptr() == buffer.data_ptr()
+
+
+@requires_cuda
+@pytest.mark.parametrize("budget", [16, 2048])
+@pytest.mark.parametrize("kv_quant", ["none", "fp8", "nvfp4"])
+def test_draft_reuses_saved_blocks_but_updates_tail_and_index_cache(monkeypatch, budget, kv_quant):
+    from freetoken.kernel.triton.qsa import expand_qsa_block_indices
+
+    config = parsed_config(budget=budget)
+    fixture = Fixture(config, num_pages=16, kv_quant=kv_quant)
+    attn = fixture.layer(QSA_LAYER)
+    x = _inputs(fixture, [66])[0]
+    saved = torch.empty((1, budget // 4), device="cuda", dtype=torch.int32)
+    seed = fixture.batch([fixture.req(1, 0, 61)], "prefill")
+    seed.mtp_qsa_blocks = {QSA_LAYER: saved}
+    attn.forward(x[:61], seed)
+    blocks = saved.clone()
+    assert (blocks[blocks >= 0] < 15).all()
+    assert (blocks >= 0).sum().item() == min(15, budget // 4)
+
+    def unexpected(*a, **kw):
+        raise AssertionError("reuse must skip query norm, scores and top-k")
+
+    original_select = fixture.backend._select
+    monkeypatch.setattr(fixture.backend, "_select", unexpected)
+    for position in (61, 62):
+        batch = fixture.batch([fixture.req(1, position, position + 1)], "prefill")
+        batch.mtp_qsa_blocks, batch.mtp_qsa_reuse = {QSA_LAYER: saved}, True
+        got = attn.forward(x[position:position + 1], batch)
+        expected_indices = torch.empty((1, budget + 3), device="cuda", dtype=torch.int32)
+        expand_qsa_block_indices(blocks, batch.positions, batch.attn_metadata.seq_lens,
+                                 batch.attn_metadata.token_to_req, 4, budget, expected_indices)
+        assert position in expected_indices[0].tolist()
+        assert not (expected_indices > position).any()
+        torch.testing.assert_close(saved, blocks, rtol=0, atol=0)
+        reference = fixture.batch([fixture.req(1, position, position + 1)], "prefill")
+        monkeypatch.setattr(fixture.backend, "_select", lambda *a, **kw: expected_indices)
+        expected = attn.forward(x[position:position + 1], reference)
+        assert torch.equal(got, expected)
+        if budget == 2048:
+            monkeypatch.setattr(fixture.backend, "_select", original_select)
+            assert torch.equal(got, attn.forward(x[position:position + 1], reference))
+        monkeypatch.setattr(fixture.backend, "_select", unexpected)
+
+    # A full selection at closure must see keys written during reused steps.
+    monkeypatch.setattr(fixture.backend, "_select", original_select)
+    closure = fixture.batch([fixture.req(1, 63, 64)], "prefill")
+    closure.mtp_qsa_blocks = {QSA_LAYER: saved}
+    got = attn.forward(x[63:64], closure)
+    attn.forward(x[:63], fixture.batch([fixture.req(2, 0, 63)], "prefill"))
+    expected = attn.forward(x[63:64], fixture.batch([fixture.req(2, 63, 64)], "prefill"))
+    assert torch.equal(got, expected)
+
+
+@requires_cuda
+def test_draft_qsa_reuse_graph_reads_updated_blocks_positions_and_request_slot():
+    from freetoken.kernel.triton.qsa import expand_qsa_block_indices
+
+    fixture = Fixture(parsed_config(budget=16), num_pages=16, kv_quant="nvfp4")
+    attn = fixture.layer(QSA_LAYER)
+    x = _inputs(fixture, [70, 70])
+    for slot in (1, 2):
+        attn.forward(x[slot - 1][:69], fixture.batch([fixture.req(slot, 0, 69)], "prefill"))
+    blocks = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device="cuda")
+    static = fixture.batch([fixture.req(1, 61, 62)], "prefill")
+    static.mtp_qsa_blocks, static.mtp_qsa_reuse = {QSA_LAYER: blocks}, True
+    static_x = x[0][61:62].clone()
+    attn.forward(static_x, static)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = attn.forward(static_x, static)
+    for slot, position, selected in ((1, 61, [0, 1, 2, 3]), (2, 62, [10, 9, 8, 7]),
+                                     (1, 65, [5, 3, 1, 0])):
+        live = fixture.batch([fixture.req(slot, position, position + 1)], "prefill")
+        static.positions.copy_(live.positions)
+        static.out_loc.copy_(live.out_loc)
+        for name in ("seq_lens", "ring_slots", "block_table"):
+            getattr(static.attn_metadata, name).copy_(getattr(live.attn_metadata, name))
+        static_x.copy_(x[slot - 1][position:position + 1])
+        blocks.copy_(torch.tensor([selected], device="cuda", dtype=torch.int32))
+        graph.replay()
+        got = output.clone()
+        indices = torch.empty((1, 19), device="cuda", dtype=torch.int32)
+        expand_qsa_block_indices(blocks, live.positions, live.attn_metadata.seq_lens,
+                                 live.attn_metadata.token_to_req, 4, 16, indices)
+        original_select = fixture.backend._select
+        fixture.backend._select = lambda *a, **kw: indices
+        try:
+            expected = attn.forward(static_x, live)
+        finally:
+            fixture.backend._select = original_select
+        assert torch.equal(got, expected)
+
+
 def _inputs(fixture: Fixture, lengths, extra: int = 0, seed: int = 11):
     generator = torch.Generator(device=fixture.device).manual_seed(seed)
     return [
@@ -177,6 +303,7 @@ def test_decode_graph_replay_matches_eager():
     capture_batch = SimpleNamespace(
         padded_reqs=[dummy] * bs, reqs=[dummy] * bs, phase="decode", size=bs, padded_size=bs,
         is_prefill=False, is_decode=True, positions=static["positions"],
+        use_decode_moe=False,
         out_loc=static["out_loc"], attn_metadata=None, active_table_idx=None,
     )
     fixture.backend.prepare_for_capture(capture_batch)
@@ -221,6 +348,38 @@ def test_row_chunked_scoring_matches_one_chunk(monkeypatch):
     monkeypatch.setattr(qsa_sparse, "_LOGITS_WORKSPACE_BYTES", 64 * columns * 4)
     chunked = attn.forward(x, fixture.batch([fixture.req(1, 0, length)], "prefill"))
     assert torch.equal(chunked, whole)
+
+
+@requires_cuda
+@pytest.mark.parametrize("cached_len", [63, 4097])
+@pytest.mark.parametrize("kv_quant", ["none", "nvfp4"])
+def test_speculative_active_pages_match_full_capacity(cached_len, kv_quant):
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=128, kv_quant=kv_quant)
+    fixture.page_table = torch.zeros(
+        (fixture.num_req_slots, 1000128), dtype=torch.int32, device=fixture.device
+    )
+    fixture.ctx.page_table = fixture.page_table
+    fixture.backend.init_capture_graph(max_seq_len=1000128, bs_list=[4])
+    attn = fixture.layer(QSA_LAYER)
+    x = _inputs(fixture, [cached_len], extra=4)[0]
+    prefix = fixture.req(0, 0, cached_len)
+    attn.forward(x[:cached_len], fixture.batch([prefix], "prefill"))
+    req = fixture.req(0, cached_len, cached_len + 4)
+    batch = fixture.batch([req], "prefill")
+    batch.use_decode_moe = True
+    assert batch.attn_metadata.block_table.shape[1] == 128
+    ring = fixture.pool.pending_ring(0)
+    saved_ring = ring.clone()
+    bounded = attn.forward(x[cached_len:], batch)
+    ring.copy_(saved_ring)
+    batch = fixture.batch([req], "prefill")
+    batch.use_decode_moe = True
+    md = batch.attn_metadata
+    md.block_table = fixture.backend._block_table(md.ring_slots.to(torch.int64))
+    assert md.block_table.shape[1] == 15627
+    full = attn.forward(x[cached_len:], batch)
+    assert torch.equal(bounded, full)
 
 
 @requires_cuda

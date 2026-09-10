@@ -100,17 +100,22 @@ class ParallelLMHead(VocabParallelEmbedding):
         return {} if result is None else result
 
     @nvtx_annotate("LMHead")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, all_tokens: bool = False) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
-        if batch.is_prefill:
+        if batch.is_prefill and not all_tokens:
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
 
         module = self.tied_embedding or self
-        logits = F.linear(x, module.weight, self.bias)
+        if all_tokens and x.shape[0] > 1:
+            from .linear import rowwise_linear
+
+            logits = rowwise_linear(x, module.weight, self.bias)
+        else:
+            logits = F.linear(x, module.weight, self.bias)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape

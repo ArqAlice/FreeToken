@@ -1,0 +1,72 @@
+--- before/python/freetoken/scheduler/mtp.py
++++ after/python/freetoken/scheduler/mtp.py
+@@ -7,7 +7,7 @@
+ 
+ from freetoken.core import Batch
+ from freetoken.engine.engine import ForwardOutput
+-from freetoken.engine.speculative import acceptance_prefix
++from freetoken.engine.speculative import acceptance_prefix, matching_prefix
+ from freetoken.utils import div_ceil, init_logger
+ 
+ from .prefill import ChunkedReq
+@@ -29,6 +29,7 @@
+         self._target_graphs = {}
+         self._draft_graphs = {}
+         self._sampling_args = {}
++        self._greedy_draft = os.environ.get("FREETOKEN_MTP_GREEDY_DRAFT", "0") == "1"
+         self._verify_history = None
+         max_drafts = getattr(getattr(scheduler, "config", None), "mtp_speculative_tokens", 4)
+         self._history_steps = min(5, max(2, max_drafts + 1))
+@@ -179,7 +180,7 @@
+         if next_token is not None and getattr(getattr(self.scheduler, "config", None), "mtp_speculative_tokens", 1) > 1:
+             self.draft_states[req.uid] = hidden[-1:].clone()
+         if next_token is not None:
+-            if req.sampling_params.is_greedy:
++            if req.sampling_params.is_greedy or self._greedy_draft:
+                 self.drafts[req.uid] = logits[-1].argmax().to(torch.int32).reshape(1)
+             else:
+                 args = self._sample_args(batch)
+@@ -195,7 +196,7 @@
+             position = req.cached_len + i - 1
+             batch = self._batch(req, position, position + 1, tokens[-1], host_input=False)
+             logits, hidden = self._head(tokens[-1], hidden, batch)
+-            if req.sampling_params.is_greedy:
++            if req.sampling_params.is_greedy or self._greedy_draft:
+                 token = logits[-1].argmax().to(torch.int32).reshape(1)
+             else:
+                 args = self._sample_args(batch)
+@@ -367,10 +368,16 @@
+         batch = self._batch(req, start, end + count, verify_ids)
+         tracked = self._track_verification(batch)
+         logits, residual = self._target(batch, all_tokens=True)
+-        if greedy:
+-            verified = logits.argmax(dim=-1).to(torch.int32)
+-            flags = draft.eq(verified[:-1])
+-            accepted = int(flags.to(torch.int32).cumprod(0).sum().item())
++        if greedy or self._greedy_draft:
++            if greedy:
++                verified = logits.argmax(dim=-1).to(torch.int32)
++            else:
++                args = self._sample_args(batch)
++                probs = self.engine.sampler.probabilities(logits, args)
++                verified = self.engine.sampler.sample_probs(probs).to(torch.int32)
++            # With deterministic proposals, a target draw both verifies and supplies
++            # the correction; samples after the first mismatch are discarded.
++            accepted = int(matching_prefix(verified, draft).item())
+             last = verified[accepted:accepted + 1]
+         else:
+             args = self._sample_args(batch)
+--- before/python/freetoken/engine/speculative.py
++++ after/python/freetoken/engine/speculative.py
+@@ -1,6 +1,11 @@
+ """Distribution-preserving acceptance and residual sampling for draft tokens."""
+ 
+ import torch
++
++
++def matching_prefix(verified, draft):
++    """Count draft tokens matching independent target samples up to first mismatch."""
++    return draft.eq(verified[:draft.numel()]).to(torch.int32).cumprod(0).sum()
+ 
+ 
+ def rejection_probabilities(target, draft, tokens, *, uniforms=None):

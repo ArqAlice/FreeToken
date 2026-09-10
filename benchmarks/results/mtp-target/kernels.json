@@ -1,0 +1,26 @@
+{
+  "cutoff": 6031164967643.226,
+  "categories": {
+    "other": {
+      "calls": 154371,
+      "microseconds": 683249.1059998977
+    },
+    "bf16_gemv": {
+      "calls": 38180,
+      "microseconds": 1035706.5989999747
+    },
+    "routing_cache": {
+      "calls": 3674,
+      "microseconds": 36531.45400000016
+    },
+    "expert_copy": {
+      "calls": 3674,
+      "microseconds": 1974040.9100000074
+    },
+    "expert_gemv": {
+      "calls": 7348,
+      "microseconds": 127802.63299999994
+    }
+  },
+  "note": "Excludes prefill up to its last expert kernel. Includes decode target and draft. Kernel durations overlap across streams and are not exclusive wall time."
+}

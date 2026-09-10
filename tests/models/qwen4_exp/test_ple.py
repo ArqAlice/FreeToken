@@ -316,6 +316,54 @@ def test_fresh_slots_read_a_zero_state():
     assert torch.equal(got, want)
 
 
+@requires_cuda
+@pytest.mark.parametrize("count", [1, 2, 5])
+def test_speculative_ple_conv_matches_decode_exactly(count):
+    config = _config()
+    args = config.qwen4_args
+    layer = _make_layer(config, device="cuda", dtype=torch.bfloat16, rows=4096)
+    meta = _meta([[3] * count], [[7, 8]], device="cuda")
+    x = torch.randn(count, args.ple_state_width, device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn(1, args.ple_state_width, args.ple_conv_state_len,
+                          device="cuda", dtype=torch.bfloat16)
+    expected_state = initial.clone()
+    expected = torch.cat([layer._decode_conv(row, meta, expected_state) for row in x.split(1)])
+    actual_state = initial.clone()
+    actual = layer._short_conv(x, meta, actual_state, stepwise=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("count", [2, 5])
+def test_speculative_ple_history_reconstructs_conv_prefixes(count):
+    config = _config()
+    args = config.qwen4_args
+    layer = _make_layer(config, device="cuda", dtype=torch.bfloat16, rows=4096)
+    meta = _meta([[3] * count], [[7, 8]], device="cuda")
+    hidden = torch.randn(count, args.ple_state_width, device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn(1, args.ple_state_width, args.ple_conv_state_len,
+                          device="cuda", dtype=torch.bfloat16)
+    history = torch.full((7, args.ple_state_width), float("nan"),
+                         device="cuda", dtype=torch.bfloat16)
+    batch = SimpleNamespace(use_decode_moe=True, mtp_ple_inputs={layer.layer_id: history})
+    states = initial.clone()
+    output = layer.forward(hidden, batch, meta=meta, conv_states=states)
+    final_state = states.clone()
+    assert history[count:].isnan().all()
+    for prefix in range(1, count + 1):
+        expected = initial.clone()
+        layer._short_conv(history[:prefix], meta, expected, stepwise=True)
+        retained = torch.cat((initial[0], history[:prefix].transpose(0, 1)), dim=-1)
+        assert torch.equal(retained[:, -args.ple_conv_state_len:], expected[0])
+    assert torch.equal(expected, final_state)
+    batch.mtp_ple_inputs = None
+    states.copy_(initial)
+    reference = layer.forward(hidden, batch, meta=meta, conv_states=states)
+    assert torch.equal(reference, output)
+    assert torch.equal(states, final_state)
+
+
 @pytest.mark.parametrize("cuts", [[1], [2, 3, 4], [9]], ids=["first-token", "uneven-mix", "penultimate"])
 def test_chunked_prefill_matches_one_shot(cuts):
     """Chunked prefill at arbitrary cut points (including chunks shorter than the conv state) matches one shot."""
@@ -628,6 +676,30 @@ def test_context_matches_the_token_history_across_chunks_and_decode():
 # --------------------------------------------------------------------------------------
 # CUDA graph + prefetch overlap
 # --------------------------------------------------------------------------------------
+
+
+@requires_cuda
+@pytest.mark.parametrize("count", [1, 2])
+def test_continuation_graph_replay_matches_eager(count):
+    config = _config()
+    args = config.qwen4_args
+    layer = _make_layer(config, device="cuda", dtype=torch.bfloat16, rows=4096)
+    meta = _meta([[3, 4][:count]], [[7, 8]], device="cuda")
+    hidden = torch.randn(count, args.ple_state_width, device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn(1, args.ple_state_width, args.ple_conv_state_len,
+                          device="cuda", dtype=torch.bfloat16) * 0.1
+    states = initial.clone()
+    expected = _forward(layer, hidden, meta, states).clone()
+    expected_state = states.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = _forward(layer, hidden, meta, states)
+    for _ in range(3):
+        layer._prefill_indices([17], hidden.device)
+        states.copy_(initial)
+        graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(states, expected_state, rtol=0, atol=0)
 
 
 @requires_cuda

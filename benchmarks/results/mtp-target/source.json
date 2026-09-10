@@ -1,0 +1,31 @@
+{
+  "branch": "feat/mtp-support",
+  "base_head": "3381015664c3acc5003b04fcad9a29742429792c",
+  "patch_reference": "Pre-additional-optimization runtime snapshot; includes prior uncommitted work",
+  "versions": {
+    "torch": "2.11.0+cu130",
+    "triton": "3.6.0",
+    "transformers": "5.16.1"
+  },
+  "python": "3.12.3",
+  "runtime_changed": [
+    "python/freetoken/layers/linear.py",
+    "python/freetoken/moe/offload_cache.py",
+    "python/freetoken/moe/offload_kernels.py"
+  ],
+  "sha256": {
+    "python/freetoken/layers/linear.py": "ede9decdebe87546dad08cb3c9d85f2803ee75911c07af6586f60daf9826544c",
+    "python/freetoken/moe/offload_cache.py": "b09151bb9db38cb9939c6099a2c6d18e86c16d63d8b6810d1bfcefb5c2c7070e",
+    "python/freetoken/moe/offload_kernels.py": "3772b0385610569e4661cbe725113ca1d49090b100f74b864f25db54807555aa",
+    "tests/moe/test_offload.py": "ee67d6a91f9dca03098d8209c3f0518acca2a0cf0f2721d40a4bc5ff3906830e",
+    "tests/moe/test_fused_copy.py": "86328ea102a28341125fa7f7d926a5566ca1fd96d4e88449db0f420c441908f7",
+    "tests/layers/test_linear_mtp.py": "3ab2f4edb22ee9edcfc92f288bc839e5dccd4ba7dee4b8834bfdf296859ea20a",
+    "tests/scheduler/test_cache_rebuild.py": "fe2ba0d6d3428ccaf62a47f659bceae9d8718b7f2ec84c430f27c88a9f04f31e",
+    "tests/scheduler/test_mtp.py": "393499b5bcdf5fbc32df8b630bacc09f6f26bdd93ab60085eec854e249869d52",
+    "benchmarks/bench_mtp.py": "d40a2da087f3841db6490472e9a71e13e704f1a497f477e33f8cb4f3f062e9e4",
+    "benchmarks/bench_mtp_chat.py": "098e6172813886bb4b63fbc60079ff8911cafba7c0299903feb7e7683053da48",
+    "benchmarks/bench_mtp_linear.py": "fce06ed4ee9207026be2aa8e216e3c2eaef2889ed3664b085315c40ac6be54d0",
+    "benchmarks/bench_mtp_copy.py": "35a46549f29e5f5da3681d994b63fd23492dba8db289e95c4d4a6259657b551c",
+    "benchmarks/mtp_diagnostics.py": "ca6f513085839b030cf4094614798c3ba4f3b9ecd2fa25b0886a93ab571c1641"
+  }
+}

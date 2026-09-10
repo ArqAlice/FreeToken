@@ -40,6 +40,10 @@ class Qwen4ExpArgs:
     index_head_dim: int
     index_budget: int
     index_ratio: int
+    # The checkpoint may carry a Qwen4-style MTP head. Its layers reuse the base
+    # decoder geometry but own independent QSA KV and routed-expert state.
+    mtp_num_hidden_layers: int = 0
+    mtp_dense_quant: str = "none"
 
     @property
     def index_topk_blocks(self) -> int:
@@ -149,6 +153,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    mtp_dense_quant = "none"
     get = _quant_get(hf_config)
     if get is None:
         expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
@@ -176,11 +181,24 @@ def parse_config(hf_config: Any) -> ModelConfig:
             prefix = "model.language_model.layers.0"
             expert_quant = _quant(f"{prefix}.mlp.experts.0.gate_proj")
             dense_quant = _quant(f"{prefix}.mlp.shared_expert.gate_proj")
+            mtp_dense_quant = _quant("mtp.layers.0.mlp.shared_expert.gate_proj")
             attn_quant = _quant(f"{prefix}.self_attn.q_proj")
             lm_head_quant = _quant("lm_head")
 
     layer_types = _layer_types(text)
+    mtp_config = (getattr(text, "mtp", None) or getattr(text, "mtp_config", None)
+                  or getattr(hf_config, "mtp_config", None))
+    mtp_layers = int(
+        getattr(text, "mtp_num_hidden_layers", getattr(hf_config, "mtp_num_hidden_layers", 0)) or 0
+    )
+    if mtp_config is not None:
+        mtp_layers = int((mtp_config.get("num_hidden_layers", mtp_layers)
+                         if isinstance(mtp_config, dict)
+                         else getattr(mtp_config, "num_hidden_layers", mtp_layers)) or 0)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
+    # MTP layers consume the same request-position KV address space as the target model.
+    # They are all full attention in the released Qwen3.8 checkpoint.
+    full_ids += tuple(range(int(text.num_hidden_layers), int(text.num_hidden_layers) + mtp_layers))
     linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
@@ -251,6 +269,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_head_dim=int(text.indexer_head_dim),
         index_budget=int(text.indexer_budget),
         index_ratio=int(text.indexer_compress_ratio),
+        mtp_num_hidden_layers=mtp_layers,
+        mtp_dense_quant=mtp_dense_quant,
     )
 
     return ModelConfig(

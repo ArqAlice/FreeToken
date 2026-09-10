@@ -360,7 +360,8 @@ class ModelConfig:
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
         """
-        return self.num_layers - self.first_k_dense_replace
+        mtp_layers = int(getattr(self.qwen4_args, "mtp_num_hidden_layers", 0) or 0)
+        return self.num_layers - self.first_k_dense_replace + mtp_layers
 
     @property
     def is_multimodal(self) -> bool:

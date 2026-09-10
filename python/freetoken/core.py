@@ -113,6 +113,12 @@ class Req:
 class Batch:
     reqs: List[Req]
     phase: Literal["prefill", "decode"]
+    use_decode_moe: bool = field(default=False, init=False)
+    mtp_batched_linear: bool = field(default=False, init=False)
+    mtp_recurrent_history: torch.Tensor | None = field(default=None, init=False)
+    mtp_state_indices: torch.Tensor | None = field(default=None, init=False)
+    mtp_conv_inputs: torch.Tensor | None = field(default=None, init=False)
+    mtp_ple_inputs: dict[int, torch.Tensor] | None = field(default=None, init=False)
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)

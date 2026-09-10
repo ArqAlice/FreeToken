@@ -145,6 +145,30 @@ def test_qwen4_args_payload():
     assert args.ngram_boundary_token_id == 248044
 
 
+def test_mtp_extends_qsa_and_moe_layer_ranges():
+    hf = _hf_config()
+    hf.text_config.mtp_num_hidden_layers = 1
+    hf.text_config.mtp = SimpleNamespace(num_hidden_layers=1, layer_types=["full_attention"])
+    cfg = parse_config(hf)
+
+    full = next(g for g in cfg.attention_groups if isinstance(g, FullAttentionGroupConfig))
+    assert cfg.qwen4_args.mtp_num_hidden_layers == 1
+    assert full.layer_ids[-1] == 48
+    assert full.num_index_layers == 13
+    assert cfg.num_moe_layers == 49
+
+
+def test_mtp_quantization_uses_its_own_ignore_patterns():
+    hf = _hf_config()
+    hf.text_config.mtp = {"num_hidden_layers": 1}
+    assert parse_config(hf).qwen4_args.mtp_dense_quant == "none"
+    hf.quantization_config["ignore"] = ["model.language_model.layers.*.mlp.shared_expert.*"]
+    cfg = parse_config(hf)
+    assert cfg.dense_quant == "none"
+    assert cfg.qwen4_args.mtp_dense_quant == "nvfp4"
+    assert cfg.qwen4_args.mtp_num_hidden_layers == 1
+
+
 def test_ple_on_full_attention_layer_rejected():
     hf = _hf_config()
     hf.text_config.ple_layer_ids = [4]  # one-indexed 4 == zero-based 3, a full_attention layer

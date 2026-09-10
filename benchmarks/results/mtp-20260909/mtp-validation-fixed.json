@@ -1,0 +1,48 @@
+[
+  {
+    "seconds": 85.4282808,
+    "prompt": "The capital of France is",
+    "response": {
+      "id": "cmpl-333d36e33c62423fbf57559def96748b",
+      "object": "text_completion",
+      "created": 1788945333,
+      "model": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+      "choices": [
+        {
+          "index": 0,
+          "text": " Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is Lisbon. The capital of Belgium is Brussels. The capital of the Netherlands is Amsterdam. The capital of Austria is Vienna. The capital of Switzerland is Bern. The capital of Sweden is",
+          "finish_reason": "length",
+          "logprobs": null
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "total_tokens": 69
+      }
+    }
+  },
+  {
+    "seconds": 249.02693,
+    "prompt": "Write a Python function that computes Fibonacci numbers.",
+    "response": {
+      "id": "cmpl-3b6ac4034e42469ba8b3b0d775ca012d",
+      "object": "text_completion",
+      "created": 1788945582,
+      "model": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\n\n<think>\n\n</think>\n\nHere is a Python function that computes Fibonacci numbers. I have provided two versions: a **Recursive version with Memoization** (best for general use and large numbers) and an **Iterative version** (best for memory efficiency).\n\n### Option 1: Recursive with Memoization (Recommended)",
+          "finish_reason": "length",
+          "logprobs": null
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 9,
+        "completion_tokens": 64,
+        "total_tokens": 73
+      }
+    }
+  }
+]

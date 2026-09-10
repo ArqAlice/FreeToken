@@ -171,7 +171,10 @@ def _nvfp4_gemv_kernel(
     stride_pn, stride_pkw,
     stride_sn, stride_sblk,
     BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr, OUT: tl.constexpr, EVEN_K: tl.constexpr,
+    ROW_STRIDE: tl.constexpr = 0,
 ):
+    a_ptr += tl.program_id(1) * ROW_STRIDE
+    out_ptr += tl.program_id(1) * N
     pid_n = tl.program_id(0)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
@@ -243,6 +246,7 @@ def _nvfp4_gemv_splitk_kernel(
     stride_partk, stride_partn,
     BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr, SPLIT_K: tl.constexpr,
     OUT: tl.constexpr, EVEN_K: tl.constexpr,
+    ROW_STRIDE: tl.constexpr = 0,
 ):
     """Split-K decode GEMV for small N: each ``(pid_n, pid_k)`` reduces ``tiles_per`` word-
     tiles of K into a partial sum; many more programs than the single-pass kernel -> fills
@@ -251,6 +255,10 @@ def _nvfp4_gemv_splitk_kernel(
     acq_rel arrival atomic orders the partial stores), so no separate reduce launch."""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
+    a_ptr += tl.program_id(2) * ROW_STRIDE
+    out_ptr += tl.program_id(2) * N
+    part_ptr += tl.program_id(2) * SPLIT_K * N
+    counter_ptr += tl.program_id(2) * tl.cdiv(N, BLOCK_N)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
     offs_kw = tl.arange(0, BLOCK_KW)
@@ -314,9 +322,89 @@ def _nvfp4_gemv_splitk_kernel(
         tl.store(counter_ptr + pid_n, 0)  # leave zeroed for the next launch/replay
 
 
+@triton.jit
+def _nvfp4_gemv_shared_rows_kernel(
+    a_ptr, packed_ptr, scale_ptr, gscale_ptr, part_ptr, counter_ptr, out_ptr,
+    N, K, K_WORDS, tiles_per,
+    stride_am, stride_pn, stride_pkw, stride_sn, stride_sblk,
+    ROWS: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_KW: tl.constexpr,
+    SPLIT_K: tl.constexpr, OUT: tl.constexpr, EVEN_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_kw = tl.arange(0, BLOCK_KW)
+    n_mask = offs_n < N
+    p_base = packed_ptr + offs_n[None, :] * stride_pn
+    s_base = scale_ptr + offs_n[None, :] * stride_sn
+    # A rank-3 row axis changes Triton's reduction layout and can flip BF16 rounding.
+    # Separate 2-D accumulators keep the decode kernel's layout.
+    partials = ()
+    for row in tl.static_range(ROWS):
+        partials += (tl.zeros((BLOCK_KW, BLOCK_N), dtype=tl.float32),)
+    for t in range(tiles_per):
+        widx = (pid_k * tiles_per + t) * BLOCK_KW + offs_kw
+        offs_a = (pid_k * tiles_per + t) * BLOCK_KW * 8 + tl.arange(0, BLOCK_KW * 8)
+        if EVEN_K:
+            w_mask = tl.full((BLOCK_KW,), True, tl.int1)
+        else:
+            w_mask = widx < K_WORDS
+        weight_mask = w_mask[:, None] & n_mask[None, :]
+        word = tl.load(p_base + widx[:, None] * stride_pkw, mask=weight_mask, other=0)
+        s_ptrs = s_base + (widx[:, None] // 2) * stride_sblk
+        if e4m3_native_cx():
+            scale = tl.load(s_ptrs, mask=weight_mask, other=0.0).to(tl.float32) * 16384.0
+        else:
+            scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=weight_mask, other=0)) * 16384.0
+        next_partials = ()
+        for row in tl.static_range(ROWS):
+            if EVEN_K:
+                a_vec = tl.load(a_ptr + row * stride_am + offs_a).to(tl.float32)
+            else:
+                a_vec = tl.load(a_ptr + row * stride_am + offs_a,
+                                mask=offs_a < K, other=0.0).to(tl.float32)
+            a0, a1, a2, a3, a4, a5, a6, a7 = _split8(a_vec, BLOCK_KW)
+            acc_w = tl.zeros((BLOCK_KW, BLOCK_N), dtype=tl.float32)
+            b_lo, b_hi = _nvfp4_pair_f32(word)
+            acc_w += a0[:, None] * b_lo
+            acc_w += a4[:, None] * b_hi
+            b_lo, b_hi = _nvfp4_pair_f32(word >> 4)
+            acc_w += a1[:, None] * b_lo
+            acc_w += a5[:, None] * b_hi
+            b_lo, b_hi = _nvfp4_pair_f32(word >> 8)
+            acc_w += a2[:, None] * b_lo
+            acc_w += a6[:, None] * b_hi
+            b_lo, b_hi = _nvfp4_pair_f32(word >> 12)
+            acc_w += a3[:, None] * b_lo
+            acc_w += a7[:, None] * b_hi
+            next_partials += (partials[row] + acc_w * scale,)
+        partials = next_partials
+    # Keep the decode kernel's K tree and split-K sum order for exact greedy verification.
+    for row in tl.static_range(ROWS):
+        acc = tl.sum(partials[row], axis=0)
+        if SPLIT_K == 1:
+            g = tl.load(gscale_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+            tl.store(out_ptr + row * N + offs_n, (acc * g).to(OUT), mask=n_mask)
+        else:
+            tl.store(part_ptr + (row * SPLIT_K + pid_k) * N + offs_n, acc, mask=n_mask)
+    if SPLIT_K > 1:
+        counter = counter_ptr + pid_n
+        cnt = tl.atomic_add(counter, 1)
+        if cnt == SPLIT_K - 1:
+            for row in tl.static_range(ROWS):
+                total = tl.zeros((BLOCK_N,), dtype=tl.float32)
+                for k in tl.static_range(SPLIT_K):
+                    total += tl.load(part_ptr + (row * SPLIT_K + k) * N + offs_n,
+                                     mask=n_mask, other=0.0)
+                g = tl.load(gscale_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)
+                tl.store(out_ptr + row * N + offs_n, (total * g).to(OUT), mask=n_mask)
+            tl.store(counter, 0)
+
+
 def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
-          gscale: torch.Tensor, out_dtype: torch.dtype, transposed: bool) -> torch.Tensor:
-    """M==1 W4A16 GEMV. ``a`` [K] compute-dtype; ``packed_i32`` logical [N, K//8] int32
+          gscale: torch.Tensor, out_dtype: torch.dtype, transposed: bool,
+          *, shared_rows: bool = False) -> torch.Tensor:
+    """Independent W4A16 GEMV rows. ``a`` [K] or [M, K]; ``packed_i32`` [N, K//8] int32
     (row-major or a K-major transposed view); ``scale`` logical [N, K//16] fp8; ``gscale``
     [N] fp16. Picks split-K so small ``N`` (shared expert) still fills the SMs; large ``N``
     (lm_head) stays single-pass (split_k=1)."""
@@ -324,7 +412,9 @@ def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
     N = packed_i32.shape[0]
     K = packed_i32.shape[1] * 8
     scale = e4m3_kernel_view(scale)
-    out = torch.empty(N, dtype=out_dtype, device=a.device)
+    rows = a.numel() // K
+    row_stride = a.stride(0) if a.ndim == 2 else 0
+    out = torch.empty((rows, N) if rows > 1 else (N,), dtype=out_dtype, device=a.device)
     block_kw = _GEMV_BLOCK_KW_T if transposed else _GEMV_BLOCK_KW_ROW
     sk_block_n = _GEMV_SPLITK_BLOCK_N_T if transposed else _GEMV_SPLITK_BLOCK_N_ROW
 
@@ -335,12 +425,31 @@ def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
     split_k = max(1, min(_GEMV_SPLITK_TARGET // max(n_blocks_n, 1), num_tiles))
     split_k = 1 << (split_k.bit_length() - 1)
 
+    if shared_rows and 1 < rows <= 5:
+        block_n = _GEMV_BLOCK_N if split_k == 1 else sk_block_n
+        block_kw = block_kw if split_k == 1 else _GEMV_SPLITK_BLOCK_KW
+        num_tiles = triton.cdiv(K_WORDS, block_kw)
+        tiles_per = triton.cdiv(num_tiles, split_k)
+        even = (K % (block_kw * 8) == 0) and (num_tiles == tiles_per * split_k)
+        n_blocks_n = triton.cdiv(N, block_n)
+        part = (torch.empty((rows, split_k, N), dtype=torch.float32, device=a.device)
+                if split_k > 1 else out)
+        counters = _splitk_counters(n_blocks_n, a.device) if split_k > 1 else out
+        _nvfp4_gemv_shared_rows_kernel[(n_blocks_n, split_k)](
+            a, packed_i32, scale, gscale, part, counters, out,
+            N, K, K_WORDS, tiles_per, row_stride,
+            packed_i32.stride(0), packed_i32.stride(1), scale.stride(0), scale.stride(1),
+            ROWS=rows, BLOCK_N=block_n, BLOCK_KW=block_kw, SPLIT_K=split_k,
+            OUT=out_tl, EVEN_K=even, num_warps=_GEMV_WARPS,
+        )
+        return out
+
     if split_k == 1:  # large N (lm_head): single-pass full-K, direct global-scaled write
         even = K % (block_kw * 8) == 0
-        _nvfp4_gemv_kernel[(triton.cdiv(N, _GEMV_BLOCK_N),)](
+        _nvfp4_gemv_kernel[(triton.cdiv(N, _GEMV_BLOCK_N), rows)](
             a, packed_i32, scale, gscale, out, N, K,
             packed_i32.stride(0), packed_i32.stride(1), scale.stride(0), scale.stride(1),
-            BLOCK_N=_GEMV_BLOCK_N, BLOCK_KW=block_kw, OUT=out_tl, EVEN_K=even,
+            BLOCK_N=_GEMV_BLOCK_N, BLOCK_KW=block_kw, OUT=out_tl, EVEN_K=even, ROW_STRIDE=row_stride,
             num_warps=_GEMV_WARPS,
         )
         return out
@@ -348,14 +457,14 @@ def _gemv(a: torch.Tensor, packed_i32: torch.Tensor, scale: torch.Tensor,
     tiles_per = triton.cdiv(num_tiles, split_k)
     # Even iff every (tile_start + t) word tile is fully in range for every pid_k.
     even = (K % (_GEMV_SPLITK_BLOCK_KW * 8) == 0) and (num_tiles == tiles_per * split_k)
-    part = torch.empty((split_k, N), dtype=torch.float32, device=a.device)
-    counters = _splitk_counters(n_blocks_n, a.device)
-    _nvfp4_gemv_splitk_kernel[(n_blocks_n, split_k)](
+    part = torch.empty((rows, split_k, N), dtype=torch.float32, device=a.device)
+    counters = _splitk_counters(rows * n_blocks_n, a.device)
+    _nvfp4_gemv_splitk_kernel[(n_blocks_n, split_k, rows)](
         a, packed_i32, scale, gscale, part, counters, out, N, K, K_WORDS, tiles_per,
         packed_i32.stride(0), packed_i32.stride(1), scale.stride(0), scale.stride(1),
-        part.stride(0), part.stride(1),
+        part.stride(1), part.stride(2),
         BLOCK_N=sk_block_n, BLOCK_KW=_GEMV_SPLITK_BLOCK_KW, SPLIT_K=split_k,
-        OUT=out_tl, EVEN_K=even,
+        OUT=out_tl, EVEN_K=even, ROW_STRIDE=row_stride,
         num_warps=_GEMV_WARPS,
     )
     return out
@@ -844,6 +953,19 @@ def nvfp4_dense_linear_t(
 # BaseOP linear layers (TP=1, replicated). Buffers: uint8 packed ``weight`` + fp8 block
 # ``weight_scale`` + fp16 per-row ``weight_global``.
 # ======================================================================================
+def _rowwise_nvfp4(x, weight, scale, global_scale, transposed, bias=None):
+    if _USE_REF:
+        fn = nvfp4_dense_linear_t if transposed else nvfp4_dense_linear
+        return torch.cat([fn(row, weight, scale, global_scale, bias) for row in x.split(1)])
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    packed = weight.t() if transposed else weight.view(torch.int32)
+    scales = scale.t() if transposed else scale
+    shared_rows = packed.shape[0] >= 8192 and os.getenv("FREETOKEN_MTP_NVFP4_SHARED_ROWS", "1") == "1"
+    output = _gemv(x, packed, scales, global_scale, x.dtype, transposed, shared_rows=shared_rows)
+    return output + bias.to(output.dtype) if bias is not None else output
+
+
 class Nvfp4DenseLinear(BaseOP):
     """Replicated NVFP4 dense linear (W4A16). Drop-in for ``LinearReplicated`` /
     ``LinearRowParallel`` at TP=1 on the mixed-precision checkpoint's NVFP4 dense weights.
@@ -861,6 +983,7 @@ class Nvfp4DenseLinear(BaseOP):
         self.weight_global = torch.empty(out_features, dtype=torch.float16)
         self.bias = torch.empty(out_features) if has_bias else None
         self._transposed = False
+        self._mtp_rowwise = False
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
         w = state_dict.pop(_concat_prefix(prefix, "weight"))
@@ -876,11 +999,21 @@ class Nvfp4DenseLinear(BaseOP):
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._mtp_rowwise and x.ndim == 2 and x.shape[0] > 1:
+            from freetoken.core import get_global_ctx
+
+            if get_global_ctx().batch.use_decode_moe:
+                # The multi-row NVFP4 kernel can round differently at BF16 boundaries.
+                return self._rowwise(x)
         if self._transposed:
             return nvfp4_dense_linear_t(
                 x, self.weight, self.weight_scale, self.weight_global, self.bias
             )
         return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global, self.bias)
+
+
+    def _rowwise(self, x):
+        return _rowwise_nvfp4(x, self.weight, self.weight_scale, self.weight_global, self._transposed, self.bias)
 
 
 class Nvfp4DenseColMerged(Nvfp4DenseLinear):
@@ -918,13 +1051,15 @@ class Nvfp4LMHead(BaseOP):
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, all_tokens: bool = False) -> torch.Tensor:
         from freetoken.core import get_global_ctx
 
         batch = get_global_ctx().batch
-        if batch.is_prefill:
+        if batch.is_prefill and not all_tokens:
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
+        if all_tokens and x.shape[0] > 1:
+            return _rowwise_nvfp4(x, self.weight, self.weight_scale, self.weight_global, self._transposed)
         if self._transposed:
             return nvfp4_dense_linear_t(x, self.weight, self.weight_scale, self.weight_global)
         return nvfp4_dense_linear(x, self.weight, self.weight_scale, self.weight_global)

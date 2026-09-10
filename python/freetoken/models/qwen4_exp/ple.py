@@ -567,6 +567,7 @@ class PLELayer(BaseOP):
             f"PLE conv history {self.state_len} exceeds CHUNK_SIZE {CHUNK_SIZE}"
         )
         self._pending: Tuple[PLEMetadata, torch.Tensor] | None = None
+        self._continuation_indices = {}
 
     def start_prefetch(self, batch: Batch, meta: PLEMetadata | None = None) -> None:
         """Hash this forward's n-grams and start the table gather on the side stream."""
@@ -605,10 +606,15 @@ class PLELayer(BaseOP):
         gated = (gate * value.unsqueeze(-2)).flatten(-2)
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
         x = self.norm_conv.forward(gated)
+        history = getattr(batch, "mtp_ple_inputs", None)
+        if history is not None:
+            history[self.layer_id][:x.shape[0]].copy_(x)
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
-        return gated + self._short_conv(x, meta, states)
+        return gated + self._short_conv(
+            x, meta, states, stepwise=getattr(batch, "use_decode_moe", False)
+        )
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
         """Copy the conv history at the GDN track boundary into the same donatable slot, so a radix
@@ -637,11 +643,15 @@ class PLELayer(BaseOP):
         return state
 
     def _short_conv(
-        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
+        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor, *, stepwise: bool = False
     ) -> torch.Tensor:
         """silu of the dilated depthwise conv over [state | x], and roll the per-request state."""
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
+        if stepwise and len(meta.seq_lens) == 1:
+            # Match decode's fp32 tap reduction; cuDNN prefill rounding can alter
+            # near-tied logits after recurrent-state differences accumulate.
+            return torch.cat([self._decode_conv(row, meta, states) for row in x.split(1)])
         return self._prefill_conv(x, meta, states)
 
     def _decode_conv(
@@ -686,6 +696,10 @@ class PLELayer(BaseOP):
 
     def _prefill_indices(self, lens: List[int], device: torch.device):
         """Columns of the packed history: this forward's outputs, the state block, the next state block."""
+        cache_key = (tuple(lens), device)
+        tiny = len(lens) == 1 and lens[0] in (1, 2)
+        if tiny and cache_key in self._continuation_indices:
+            return self._continuation_indices[cache_key]
         state_len = self.state_len
         counts = torch.tensor(lens, dtype=torch.int64)
         cu = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
@@ -704,7 +718,12 @@ class PLELayer(BaseOP):
             packed = packed.pin_memory()
         packed = packed.to(device, non_blocking=True)
         n_out, n_state = out_index.numel(), len(lens) * state_len
-        return packed[:n_out], packed[n_out : n_out + n_state], packed[n_out + n_state :]
+        result = packed[:n_out], packed[n_out : n_out + n_state], packed[n_out + n_state :]
+        if tiny:
+            # Warmup stages these constants once; graph replay must not depend on
+            # the lifetime of a temporary pinned-host H2D source.
+            self._continuation_indices[cache_key] = result
+        return result
 
 
 __all__ = [

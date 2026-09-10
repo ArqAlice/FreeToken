@@ -161,6 +161,97 @@ def test_chunk_and_recurrent_rules_agree():
     )
 
 
+@pytest.mark.parametrize("use_decode_moe", [False, True])
+def test_two_token_continuation_matches_decode(use_decode_moe):
+    op, _ = _make_layer(3, seed=3)
+    ctx = _ctx(3)
+    _, reqs, _ = _prefill(op, ctx, [5], seed=13)
+    conv = ctx.linear_state_pool.conv_states.clone()
+    state = ctx.linear_state_pool.recurrent_states.clone()
+    nxt = torch.randn(2, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    expected = torch.cat([_decode(op, ctx, reqs, nxt[i:i + 1]) for i in range(2)])
+    expected_state = ctx.linear_state_pool.recurrent_states.clone()
+    ctx.linear_state_pool.conv_states.copy_(conv)
+    ctx.linear_state_pool.recurrent_states.copy_(state)
+    reqs[0].cached_len, reqs[0].device_len = 5, 7
+    batch = Batch(reqs=reqs, phase="prefill")
+    batch.use_decode_moe = use_decode_moe
+    batch.padded_reqs = reqs
+    if use_decode_moe:
+        pool = ctx.linear_state_pool
+        batch.mtp_recurrent_history = torch.empty(
+            (1, 1, 5, *pool.recurrent_states.shape[2:]), device=DEV,
+            dtype=pool.recurrent_states.dtype,
+        )
+        batch.mtp_conv_inputs = torch.empty(
+            (1, 5, op.conv_dim), device=DEV, dtype=pool.conv_states.dtype
+        )
+        batch.mtp_state_indices = torch.zeros(1, dtype=torch.int32, device=DEV)
+        raw_conv = op.in_proj.forward(nxt)[:, :op.conv_dim].clone()
+    with ctx.forward_batch(batch):
+        actual = op.forward(nxt)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(ctx.linear_state_pool.recurrent_states, expected_state,
+                               rtol=RTOL, atol=ATOL)
+    if use_decode_moe:
+        assert torch.equal(batch.mtp_conv_inputs[0, :2], raw_conv)
+        assert torch.equal(batch.mtp_recurrent_history[0, 0, 1], pool.recurrent_states[0, 1])
+        restored_conv = torch.cat((conv[0, 1], raw_conv.transpose(0, 1)), dim=-1)
+        assert torch.equal(restored_conv[:, -CONV_K + 1:], pool.conv_states[0, 1])
+
+
+@pytest.mark.parametrize("count", [2, 3, 4, 5])
+@pytest.mark.parametrize("padding", [0, 2])
+def test_fused_recurrence_is_stepwise_identical(count, padding):
+    from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla
+
+    torch.manual_seed(23)
+    q, k = [torch.randn(1, count, 16, 128, device=DEV, dtype=torch.bfloat16) for _ in range(2)]
+    v = torch.randn(1, count, 48, 128, device=DEV, dtype=torch.bfloat16)
+    a, b = [torch.randn(count, 48, device=DEV) for _ in range(2)]
+    original = torch.randn(1, 48, 128, 128, device=DEV)
+    initial = original.clone()
+    state = original.clone()
+    history = torch.full((2, count + padding, 48, 128, 128), float("nan"), device=DEV)
+    kwargs = dict(A_log=torch.zeros(48, device=DEV), dt_bias=torch.zeros(48, device=DEV),
+                  indices=torch.tensor([0], dtype=torch.int32, device=DEV), scale=128 ** -0.5)
+    cu = torch.tensor([0, count], device=DEV)
+    history_indices = torch.tensor([1], device=DEV)
+
+    def run():
+        return gdn_decode_fla(
+            q, k, v, a, b, state_source=state, cu_seqlens=cu,
+            intermediate_states_buffer=history, intermediate_state_indices=history_indices,
+            **kwargs,
+        )
+
+    joint = run()
+    expected = []
+    for j in range(count):
+        expected.append(gdn_decode_fla(q[:, j:j + 1], k[:, j:j + 1], v[:, j:j + 1],
+                                      a[j:j + 1], b[j:j + 1], state_source=original,
+                                      cu_seqlens=torch.tensor([0, 1], device=DEV), **kwargs))
+        assert torch.equal(history[1, j], original[0])
+    torch.testing.assert_close(joint, torch.cat(expected), rtol=0, atol=0)
+    torch.testing.assert_close(state, original, rtol=0, atol=0)
+    assert history[0].isnan().all()
+    assert history[1, count:].isnan().all()
+    expected_history = history[1, :count].clone()
+    state.copy_(initial)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    for _ in range(2):
+        state.copy_(initial)
+        history.fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(captured, joint)
+        assert torch.equal(state, original)
+        assert torch.equal(history[1, :count], expected_history)
+        assert history[0].isnan().all()
+        assert history[1, count:].isnan().all()
+
+
 def test_output_gate_comes_from_the_config():
     """The gate activation is the group config's string, not a hardcoded silu. Both gates track
     their own reference, and the two are far apart -- so a stuck activation cannot pass."""

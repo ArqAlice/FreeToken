@@ -101,6 +101,33 @@ def _as_last_data(batch):
     )
 
 
+def test_multiple_sampled_tokens_finish_at_host_output_budget():
+    pool, cm, tm, dm, pm, sent, stub = _setup()
+    req = _launch_req(pool, cm, tm, torch.tensor([1, 2, 3, 4]))
+    req.append_host(torch.tensor([11, 12]))
+    req.device_len = req.max_device_len
+    req.cached_len = req.device_len - 1
+    # Allocate the remaining pages before simulating the completed verification.
+    cm.allocate_paged([SimpleNamespace(table_idx=req.table_idx, cached_len=4, device_len=7)])
+    output = (None, torch.tensor([[13, 14, 15, 16, 17]]), SimpleNamespace(synchronize=lambda: None))
+    Scheduler._process_last_data(stub, (SimpleNamespace(batch=Batch([req], "decode")), output))
+    assert [m.next_token for m in sent] == [13, 14]
+    assert [m.finished for m in sent] == [False, True]
+    assert sent[-1].finish_reason == "length"
+
+
+def test_speculative_successor_is_dropped_after_eos():
+    pool, cm, tm, dm, pm, sent, stub = _setup()
+    stub.eos_token_ids = {13}
+    req = _launch_req(pool, cm, tm, torch.tensor([1, 2, 3, 4]))
+    req.cached_len, req.device_len = 5, 6
+    cm.allocate_paged([SimpleNamespace(table_idx=req.table_idx, cached_len=4, device_len=5)])
+    output = (None, torch.tensor([[13, 14, 15, 16, 17]]), SimpleNamespace(synchronize=lambda: None))
+    Scheduler._process_last_data(stub, (SimpleNamespace(batch=Batch([req], "decode")), output))
+    assert [m.next_token for m in sent] == [13]
+    assert sent[0].finished and sent[0].finish_reason == "stop"
+
+
 def test_abort_inflight_final_chunk_marks_then_drains():
     """Abort while the final prefill chunk (plain Req, already in running_reqs) is in
     flight: the handler only marks; the same iteration's drain frees exactly once."""

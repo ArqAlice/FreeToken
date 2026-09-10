@@ -88,6 +88,8 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    mtp_speculative_tokens: int = 0
+    mtp_auto: bool = False
 
     @cached_property
     def hf_config(self):

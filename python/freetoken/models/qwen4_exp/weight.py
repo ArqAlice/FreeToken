@@ -6,7 +6,8 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``model.visual.*`` (served text-only). Routed MTP experts go to a separate
+offload source bank; the remaining MTP head tensors load with the dense state dict.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import os
 import re
 import struct
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Iterator
 
 import safetensors
@@ -44,6 +46,16 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.8-Flash-Next NVFP4 experts",
+)
+_MTP_EXPERT_KEY_RE = re.compile(
+    r"^mtp\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+)
+_MTP_NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
+    key_pattern=_MTP_EXPERT_KEY_RE,
+    proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
+    layer_to_bank=lambda layer, config: layer,
+    desc="Qwen3.8-Flash-Next MTP NVFP4 experts",
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
@@ -100,8 +112,12 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 
 def _rename(raw_name: str) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith(("model.visual.", "visual.")):
         return None
+    if raw_name.startswith("mtp.layers") and ".mlp.experts." in raw_name:
+        return None
+    if raw_name.startswith("mtp."):
+        return None if raw_name.endswith(".input_scale") else raw_name
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -113,6 +129,42 @@ def _rename(raw_name: str) -> str | None:
     if raw_name.startswith("language_model."):
         return "model." + raw_name[len("language_model.") :]
     return raw_name
+
+
+def _try_mtp_nvfp4_fuse(
+    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]],
+    row_sizes: dict[str, int],
+) -> tuple[str, torch.Tensor] | tuple[()] | None:
+    """Fuse MTP shared-expert gate/up projections and materialize scalar globals per row."""
+    prefix = ".mlp.shared_expert."
+    if prefix not in name:
+        return None
+    for idx, proj in enumerate(("gate_proj", "up_proj")):
+        for source, target in (
+            (f"{prefix}{proj}.weight", ".mlp.shared_expert.gate_up_proj.weight"),
+            (f"{prefix}{proj}.weight_scale", ".mlp.shared_expert.gate_up_proj.weight_scale"),
+            (f"{prefix}{proj}.weight_scale_2", ".mlp.shared_expert.gate_up_proj.weight_global"),
+        ):
+            if name.endswith(source):
+                value = (tensor.to(torch.float16).reshape(()).expand(row_sizes[name.rsplit(".", 1)[0]]).clone()
+                         if source.endswith("weight_scale_2") else tensor)
+                key = name[: -len(source)] + target
+                slots = buf.setdefault(key, {})
+                slots[idx] = value
+                if len(slots) < 2:
+                    return ()
+                del buf[key]
+                return key, torch.cat((slots[0], slots[1]), dim=0)
+    for source, target in (
+        (f"{prefix}down_proj.weight", ".mlp.shared_expert.down_proj.weight"),
+        (f"{prefix}down_proj.weight_scale", ".mlp.shared_expert.down_proj.weight_scale"),
+        (f"{prefix}down_proj.weight_scale_2", ".mlp.shared_expert.down_proj.weight_global"),
+    ):
+        if name.endswith(source):
+            value = (tensor.to(torch.float16).reshape(()).expand(row_sizes[name.rsplit(".", 1)[0]]).clone()
+                     if source.endswith("weight_scale_2") else tensor)
+            return name[: -len(source)] + target, value
+    return None
 
 
 def _try_fuse(
@@ -147,9 +199,9 @@ def iter_weights(
     """Yield the dense (non-expert) weights, prefix-stripped and fused to the model's buffers.
 
     Keys keep the checkpoint's module names below the stripped prefix, so the emitted set is the
-    model's state dict minus the routed experts. Nothing here is quantized: the modelopt
-    ``ignore`` list covers everything except those experts, so attention, GDN, HC, PLE, the shared
-    expert and lm_head are all plain bf16 (the n-gram hash constants stay int64). Fusions:
+    model's state dict minus the routed experts. Base dense tensors follow the checkpoint's
+    ignore list; MTP shared experts can carry native NVFP4 scales. The n-gram hash constants
+    stay int64. Fusions:
     attention q|k|v -> ``qkv_proj``, GDN ``in_proj_{qkv,z,b,a}`` -> ``in_proj``, shared-expert
     gate|up -> ``gate_up_proj``, and each per-layer HC's ``input_mix_weight_down`` |
     ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
@@ -163,6 +215,8 @@ def iter_weights(
         return
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
+    mtp_nvfp4_buf: dict[str, dict[int, torch.Tensor]] = {}
+    mtp_tensors: list[tuple[str, torch.Tensor]] = []
     for file in tqdm(
         iter_weight_files(model_path),
         desc="Loading weights",
@@ -170,6 +224,11 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
+                if raw_name.startswith("mtp."):
+                    if _rename(raw_name) is None:
+                        continue
+                    mtp_tensors.append((raw_name, f.get_tensor(raw_name)))
+                    continue
                 name = _rename(raw_name)
                 if name is None:
                     continue
@@ -181,7 +240,29 @@ def iter_weights(
                     continue
                 yield name, tensor
 
+    # Older non-MTP Qwen4 checkpoints can still contain partial ``mtp.*`` metadata.
+    # Only a complete head has its required entry projection.
+    if any(name == "mtp.fc_embedding.weight" for name, _ in mtp_tensors):
+        row_sizes = {name.rsplit(".", 1)[0]: tensor.shape[0]
+                     for name, tensor in mtp_tensors if name.endswith(".weight")}
+        for raw_name, tensor in mtp_tensors:
+            name = _rename(raw_name)
+            if name is None:
+                continue
+            fused = _try_mtp_nvfp4_fuse(name, tensor, mtp_nvfp4_buf, row_sizes)
+            if fused is not None:
+                if fused != ():
+                    yield fused
+                continue
+            fused = _try_fuse(name, tensor, fuse_buf)
+            if fused is not None:
+                if fused != ():
+                    yield fused
+                continue
+            yield name, tensor
+
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
+    assert not mtp_nvfp4_buf, f"Incomplete MTP NVFP4 fusions: {sorted(mtp_nvfp4_buf)}"
 
 
 # ======================================================================================
@@ -198,11 +279,14 @@ class PleTable:
 
     @property
     def tensor(self) -> torch.Tensor:
-        """``[total_rows, ngram_head_dim]`` float8_e4m3fn view of the bank."""
+        """``[total_rows, ngram_head_dim]`` FP8 or BF16 view of the checkpoint table."""
         return self.bank.tensor
 
 
-_PLE_ST_DTYPE = "F8_E4M3"
+_PLE_ST_DTYPES = {
+    "F8_E4M3": torch.float8_e4m3fn,
+    "BF16": torch.bfloat16,
+}
 
 
 def _safetensors_header(path: str) -> tuple[dict, int]:
@@ -234,6 +318,7 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     folder = download_hf_weight(model_path)
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale: torch.Tensor | None = None
+    table_dtype: torch.dtype | None = None
     rows = cols = 0
     for path in _ple_table_files(folder):
         header, base = _safetensors_header(path)
@@ -247,8 +332,14 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            if meta["dtype"] != _PLE_ST_DTYPE:
+            dtype = _PLE_ST_DTYPES.get(meta["dtype"])
+            if dtype is None:
                 raise ValueError(f"PLE table shard {key} has unsupported dtype {meta['dtype']}")
+            if table_dtype is not None and dtype is not table_dtype:
+                raise ValueError(
+                    f"PLE table shard {key} has dtype {meta['dtype']}, expected {table_dtype}"
+                )
+            table_dtype = dtype
             shape = meta["shape"]
             if rows and tuple(shape) != (rows, cols):
                 raise ValueError(f"PLE table shard {key} is {shape}, expected {[rows, cols]}")
@@ -263,11 +354,15 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
         )
     if cols != qwen4_args.ngram_head_dim:
         raise ValueError(f"PLE table row is {cols} wide, config says {qwen4_args.ngram_head_dim}")
+    if table_dtype is None:
+        raise ValueError("PLE table has no shards")
     if scale is None:
-        raise ValueError("PLE table has no weight_scale")
+        if table_dtype is not torch.bfloat16:
+            raise ValueError("FP8 PLE table has no weight_scale")
+        scale = torch.ones((), dtype=torch.bfloat16)
 
-    bank = HostBank((expected * rows, cols), torch.float8_e4m3fn)
-    shard_bytes = rows * cols
+    bank = HostBank((expected * rows, cols), table_dtype)
+    shard_bytes = rows * cols * table_dtype.itemsize
     bar = byte_bar(expected * shard_bytes, "Loading PLE table")
     try:
         buf = bank.memoryview()
@@ -291,14 +386,32 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
 
 def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> dict:
     """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
-    return load_nvfp4_expert_source_banks(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        layer_sink=layer_sink,
+    base_layers = config.num_layers - config.first_k_dense_replace
+    base = SimpleNamespace(
+        num_moe_layers=base_layers,
+        num_experts=config.num_experts,
+        hidden_size=config.hidden_size,
+        moe_intermediate_size=config.moe_intermediate_size,
     )
+    sources = load_nvfp4_expert_source_banks(
+        model_path, base, _NVFP4_SOURCE_SPEC, drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(), layer_sink=layer_sink,
+    )
+    mtp_layers = int(getattr(config.qwen4_args, "mtp_num_hidden_layers", 0) or 0)
+    if not mtp_layers:
+        return sources
+    mtp = SimpleNamespace(
+        num_moe_layers=mtp_layers,
+        num_experts=config.num_experts,
+        hidden_size=config.hidden_size,
+        moe_intermediate_size=config.moe_intermediate_size,
+    )
+    mtp_sources = load_nvfp4_expert_source_banks(
+        model_path, mtp, _MTP_NVFP4_SOURCE_SPEC, drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(),
+        layer_sink=(lambda layer, banks: layer_sink(base_layers + layer, banks)) if layer_sink else None,
+    )
+    return {name: sources[name] + mtp_sources[name] for name in sources}
 
 
 def load_nvfp4_expert_sources_parallel(
@@ -307,16 +420,28 @@ def load_nvfp4_expert_sources_parallel(
     """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
     from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
 
-    return load_nvfp4_expert_source_banks_parallel(
-        model_path,
-        config,
-        _NVFP4_SOURCE_SPEC,
-        drop_page_cache=drop_page_cache,
-        primary=get_tp_info().is_primary(),
-        workers=workers,
-        chunk=chunk,
-        layer_sink=layer_sink,
+    base_layers = config.num_layers - config.first_k_dense_replace
+    base = SimpleNamespace(
+        num_moe_layers=base_layers, num_experts=config.num_experts,
+        hidden_size=config.hidden_size, moe_intermediate_size=config.moe_intermediate_size,
     )
+    sources = load_nvfp4_expert_source_banks_parallel(
+        model_path, base, _NVFP4_SOURCE_SPEC, drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(), workers=workers, chunk=chunk, layer_sink=layer_sink,
+    )
+    mtp_layers = int(getattr(config.qwen4_args, "mtp_num_hidden_layers", 0) or 0)
+    if not mtp_layers:
+        return sources
+    mtp = SimpleNamespace(
+        num_moe_layers=mtp_layers, num_experts=config.num_experts,
+        hidden_size=config.hidden_size, moe_intermediate_size=config.moe_intermediate_size,
+    )
+    mtp_sources = load_nvfp4_expert_source_banks_parallel(
+        model_path, mtp, _MTP_NVFP4_SOURCE_SPEC, drop_page_cache=drop_page_cache,
+        primary=get_tp_info().is_primary(), workers=workers, chunk=chunk,
+        layer_sink=(lambda layer, banks: layer_sink(base_layers + layer, banks)) if layer_sink else None,
+    )
+    return {name: sources[name] + mtp_sources[name] for name in sources}
 
 
 __all__ = [

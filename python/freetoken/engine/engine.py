@@ -204,6 +204,17 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
     validate_attn_backend(config.attention_backend, allow_auto=False)
 
     model_config = config.model_config
+    if getattr(config, "mtp_speculative_tokens", 0) not in range(5):
+        raise ValueError("--mtp-speculative-tokens supports integers from 0 through 4")
+    if getattr(config, "mtp_auto", False):
+        if not getattr(config, "mtp_speculative_tokens", 0):
+            raise ValueError("--mtp-auto requires --mtp-speculative-tokens 1-4")
+        if getattr(getattr(config, "tp_info", None), "size", 1) != 1:
+            raise ValueError("--mtp-auto currently requires tensor parallel size 1")
+    if getattr(config, "mtp_speculative_tokens", 0) and not int(
+        getattr(getattr(model_config, "qwen4_args", None), "mtp_num_hidden_layers", 0) or 0
+    ):
+        raise ValueError("--mtp-speculative-tokens requires a checkpoint with an MTP head")
     backend_parts = [p.strip() for p in config.attention_backend.split(",")]
     for part in backend_parts:
         info = attention_backend_info(part)
@@ -482,6 +493,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            capture_target_residual=config.mtp_auto,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -753,7 +765,7 @@ class Engine:
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, config.mtp_speculative_tokens + 1)
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -975,13 +987,23 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            capture_target_residual=config.mtp_auto,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        residual = getattr(batch, "mtp_return_residual", False)
+        self.mtp_target_residual = None
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+            if use_graph:
+                logits = self.graph_runner.replay(batch)
+                if residual:
+                    self.mtp_target_residual = self.graph_runner.target_residuals[batch.padded_size][:batch.size]
+            elif residual:
+                logits, self.mtp_target_residual = self.model.forward_with_target_residual()
+            else:
+                logits = self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1286,6 +1308,13 @@ def _adjust_config(config: EngineConfig):
 
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
+    if getattr(config, "mtp_speculative_tokens", 0):
+        if getattr(getattr(model_config, "qwen4_args", None), "mtp_num_hidden_layers", 0) != 1:
+            raise ValueError("MTP currently requires exactly one Qwen4 MTP layer")
+        if config.tp_info.size != 1:
+            raise ValueError("MTP currently supports TP=1")
+        override("cache_type", "naive")
+        logger.info_rank0("MTP: disabling prefix reuse until draft cache snapshots are supported")
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)

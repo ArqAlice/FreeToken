@@ -99,6 +99,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(hidden_size, self._in_proj_split, has_bias=False)
+            self.in_proj._shared_decode = True
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
@@ -181,11 +182,21 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if batch.is_decode or batch.use_decode_moe:
+            history = getattr(batch, "mtp_recurrent_history", None)
+            conv_inputs = getattr(batch, "mtp_conv_inputs", None)
+            if conv_inputs is not None:
+                # The fused conv overwrites its input; rejection needs the raw prefix.
+                conv_inputs[li, :total].copy_(conv_in)
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            mixed = (
+                self._conv_decode(conv_in, fla.cache_indices, pool)
+                if batch.is_decode else
+                self._conv_prefill(conv_in, pool, fla.cu_seqlens, fla.cache_indices,
+                                   fla.has_initial_state).contiguous()
+            )
             B = mixed.shape[0]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
@@ -195,6 +206,8 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                intermediate_states_buffer=None if history is None else history[li],
+                intermediate_state_indices=getattr(batch, "mtp_state_indices", None),
             )
         else:
             mixed = self._conv_prefill(

@@ -11,6 +11,27 @@ def _init_tp():
         set_tp_info(rank=0, size=1)
 
 
+def test_mtp_prefill_shape_uses_decode_expert_cache(monkeypatch):
+    from types import SimpleNamespace
+    from freetoken.core import Batch
+    from freetoken.layers.moe import OffloadMoELayer
+
+    batch = Batch([], "prefill")
+    batch.use_decode_moe = True
+    monkeypatch.setattr("freetoken.layers.moe.get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    layer = SimpleNamespace(
+        prefill_forward=lambda *args: "prefill",
+        decode_forward=lambda *args: "decode",
+        _prefill_routed=lambda *args: "prefill",
+        _decode_routed=lambda *args: "decode",
+        _maybe_all_reduce=lambda value: value,
+    )
+    assert OffloadMoELayer.forward(layer, None) == "decode"
+    assert OffloadMoELayer.routed_forward(layer, None, None, None) == "decode"
+    batch.use_decode_moe = False
+    assert OffloadMoELayer.forward(layer, None) == "prefill"
+
+
 def _make_layer_and_cache():
     from freetoken.layers.moe import OffloadMoELayer
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -32,6 +53,132 @@ def _make_layer_and_cache():
     cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]})
     layer.offload_cache = cache
     return layer, cache
+
+
+@pytest.mark.parametrize("eligible", [True, False])
+@pytest.mark.parametrize("fail_shared", [True, False])
+def test_prefetch_decode_fences_cache_access_and_joins_on_failure(monkeypatch, eligible, fail_shared):
+    from types import SimpleNamespace
+    from freetoken.core import Batch
+
+    layer, cache = _make_layer_and_cache()
+    batch = Batch([], "prefill")
+    batch.use_decode_moe = eligible
+    monkeypatch.setattr("freetoken.layers.moe.get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    calls = []
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, other):
+            calls.append((self.name, "wait", other.name))
+
+    compute, transfer = Stream("compute"), Stream("transfer")
+    cache.decode_copy_stream = transfer
+
+    @contextmanager
+    def stream(value):
+        assert value is transfer
+        yield
+
+    monkeypatch.setattr(torch.cuda, "stream", stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: compute)
+    routing = (torch.ones(1, 2), torch.tensor([[0, 1]], dtype=torch.int32))
+    monkeypatch.setattr("freetoken.layers.moe.fused_topk", lambda **kw: routing)
+    monkeypatch.setattr(cache, "ensure_experts", lambda *a: calls.append("ensure"))
+    monkeypatch.setattr(cache, "copy_missing", lambda: calls.append("copy"))
+
+    def run():
+        with layer.prefetch_decode(torch.zeros(1, 8), torch.zeros(1, 4)) as prepared:
+            assert prepared is (routing if eligible else None)
+            calls.append("shared")
+            if fail_shared:
+                raise RuntimeError("shared failed")
+
+    if fail_shared:
+        with pytest.raises(RuntimeError, match="shared failed"):
+            run()
+    else:
+        run()
+    assert calls == ([("transfer", "wait", "compute"), "ensure", "copy", "shared",
+                      ("compute", "wait", "transfer")] if eligible else ["shared"])
+
+
+@pytest.mark.parametrize("target,cpu_layer,stream", [("cpu", False, True), ("hybrid", False, True),
+                                                    ("gpu", True, True), ("gpu", False, False)])
+def test_prefetch_decode_keeps_unsupported_backends_on_existing_path(monkeypatch, target, cpu_layer, stream):
+    from types import SimpleNamespace
+    layer, cache = _make_layer_and_cache()
+    cache.decode_target = target
+    cache.decode_copy_stream = object() if stream else None
+    monkeypatch.setattr(cache, "is_cpu_layer", lambda lid: cpu_layer)
+    monkeypatch.setattr("freetoken.layers.moe.get_global_ctx",
+                        lambda: SimpleNamespace(batch=SimpleNamespace(use_decode_moe=True)))
+    with layer.prefetch_decode(None, None) as routing:
+        assert routing is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("capture", [False, True])
+def test_prefetch_decode_replays_dynamic_routes_and_evictions(monkeypatch, capture):
+    from types import SimpleNamespace
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    monkeypatch.setenv("FREETOKEN_MTP_EXPERT_OVERLAP", "1")
+    monkeypatch.setattr("freetoken.layers.moe.get_global_ctx",
+                        lambda: SimpleNamespace(batch=SimpleNamespace(use_decode_moe=True)))
+    cache = OffloadMoeCache(num_layers=2, num_experts=8, cache_size=8,
+                           device=torch.device("cuda"), prefill_overlap=False)
+    sources = {}
+    for name, shape in (("gate_up", (8, 32, 32)), ("down", (8, 32, 16))):
+        sources[name] = [torch.full(shape, lid + 1., dtype=torch.bfloat16, pin_memory=True)
+                         + torch.arange(8, dtype=torch.bfloat16).view(8, 1, 1) for lid in range(2)]
+        sources[name] = [value.pin_memory() for value in sources[name]]
+    cache.set_bank_sources(sources)
+    layers = [OffloadMoELayer(lid, 8, 2, 32, 16) for lid in range(2)]
+    for layer in layers:
+        layer.offload_cache = cache
+
+        def read_bank(cache, hidden, weights, slots, **kw):
+            values = cache.bank_caches["gate_up"][slots.long(), 0, 0].float()
+            return (values * weights).sum(1, keepdim=True) + hidden
+
+        monkeypatch.setattr(layer, "_expert_gemm", read_bank)
+    hidden = torch.randn(2, 32, device="cuda")
+    logits = torch.zeros(2, 8, device="cuda")
+
+    def route(ids):
+        logits.fill_(-100)
+        logits.scatter_(1, ids, torch.tensor([[2., 1.], [2., 1.]], device="cuda"))
+
+    def run():
+        outputs = []
+        for layer in layers:
+            with layer.prefetch_decode(hidden, logits) as routing:
+                shared = hidden.square()
+            outputs.append(layer.forward_prefetched(hidden, routing) + shared)
+        return outputs
+
+    route(torch.tensor([[0, 1], [2, 3]], device="cuda"))
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    if capture:
+        with torch.cuda.graph(graph):
+            outputs = run()
+    for ids in ([[0, 1], [2, 3]], [[0, 1], [2, 3]], [[4, 5], [6, 7]], [[0, 5], [2, 7]]):
+        ids = torch.tensor(ids, device="cuda")
+        route(ids)
+        if capture:
+            graph.replay()
+        else:
+            outputs = run()
+        for lid, out in enumerate(outputs):
+            expected = ((ids.float() + lid + 1) * torch.tensor([2., 1.], device="cuda").softmax(0)).sum(1, keepdim=True)
+            torch.testing.assert_close(out, expected + hidden + hidden.square(), rtol=1e-6, atol=1e-6)
 
 
 def test_dummy_expert_sources_use_moe_layer_count(monkeypatch):
@@ -868,3 +1015,96 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize('distance', ['0', '2'])
+def test_lrfu_preserves_routes_and_decays_frequency(monkeypatch, distance):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setenv('FREETOKEN_EXPERT_LRFU_HALF_LIFE', '8')
+    monkeypatch.setenv('FREETOKEN_EXPERT_LAYER_DISTANCE', distance)
+    cache = OffloadMoeCache(2, 8, 8, torch.device('cuda'))
+    expected = torch.zeros(16)
+    last = torch.zeros(16, dtype=torch.int64)
+    for step in range(1, 41):
+        layer = step % 2
+        query = torch.tensor([[step % 8, (step + 1) % 8],
+                              [step % 8, (step + 3) % 8]], dtype=torch.int32, device='cuda')
+        raw = query.clone()
+        ids = torch.unique(raw.cpu().long() + layer * 8)
+        expected[ids] = expected[ids] * torch.exp2(-(step - last[ids]).float() / 8) + 1
+        last[ids] = step
+        cache.ensure_experts(layer, query)
+        assert torch.equal(cache.id_of_slot[query.long()], raw + layer * 8)
+        torch.testing.assert_close(cache.lrfu_frequency.cpu(), expected)
+        assert torch.equal(cache.lrfu_last.cpu(), last)
+        owners = cache.id_of_slot
+        live = owners >= 0
+        assert torch.equal(cache.slot_for_id.view(-1)[owners[live].long()],
+                           torch.arange(8, device='cuda', dtype=torch.int32)[live])
+    cache.reset()
+    assert not cache.lrfu_frequency.count_nonzero()
+    assert not cache.lrfu_last.count_nonzero()
+    raw = torch.tensor([[0, 1], [1, 2]], device='cuda', dtype=torch.int32)
+    query = raw.clone()
+    cache.ensure_experts(1, query)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        query.copy_(raw)
+        cache.ensure_experts(1, query)
+    for _ in range(5):
+        graph.replay()
+    assert torch.equal(cache.id_of_slot[query.long()], raw + 8)
+    assert int(cache.step.item()) == 6
+
+
+@pytest.mark.parametrize('half_life', ['-1', '4097'])
+def test_lrfu_rejects_invalid_half_life(monkeypatch, half_life):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    monkeypatch.setenv('FREETOKEN_EXPERT_LRFU_HALF_LIFE', half_life)
+    with pytest.raises(ValueError, match='HALF_LIFE'):
+        OffloadMoeCache(2, 8, 8, torch.device('cpu'))
+
+
+def test_lrfu_rejects_streaming_cache_before_allocation(monkeypatch):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    monkeypatch.setenv('FREETOKEN_EXPERT_LRFU_HALF_LIFE', '256')
+    with pytest.raises(ValueError, match='fewer than 40000'):
+        OffloadMoeCache(2, 8, 40000, torch.device('cpu'))
+
+
+@pytest.mark.parametrize('distance', ['-1', '17', 'nan', 'inf'])
+def test_layer_distance_rejects_invalid_value(monkeypatch, distance):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setenv('FREETOKEN_EXPERT_LAYER_DISTANCE', distance)
+    with pytest.raises(ValueError, match='LAYER_DISTANCE'):
+        OffloadMoeCache(2, 8, 8, torch.device('cpu'))
+
+
+def test_layer_distance_requires_frequency_history(monkeypatch):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setenv('FREETOKEN_EXPERT_LAYER_DISTANCE', '2')
+    monkeypatch.setenv('FREETOKEN_EXPERT_LRFU_HALF_LIFE', '0')
+    with pytest.raises(ValueError, match='positive LRFU'):
+        OffloadMoeCache(2, 8, 8, torch.device('cpu'))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+def test_layer_distance_keeps_upcoming_layer_on_equal_frequency(monkeypatch):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setenv('FREETOKEN_EXPERT_LAYER_DISTANCE', '2')
+    monkeypatch.setenv('FREETOKEN_EXPERT_LRFU_HALF_LIFE', '256')
+    cache = OffloadMoeCache(3, 2, 2, torch.device('cuda'))
+    cache.id_of_slot.copy_(torch.tensor([2, 4], device='cuda', dtype=torch.int32))
+    cache.slot_for_id[1, 0] = 0
+    cache.slot_for_id[2, 0] = 1
+    cache.lrfu_frequency.fill_(1)
+    query = torch.tensor([[0]], device='cuda', dtype=torch.int32)
+    cache.ensure_experts(0, query)
+    assert cache.id_of_slot.tolist() == [2, 0]
+    assert cache.slot_for_id[2, 0].item() == -1

@@ -1,4 +1,5 @@
 import os
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -225,7 +226,7 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not ctx.batch.use_decode_moe:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
@@ -245,7 +246,7 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        if ctx.batch.is_prefill and not ctx.batch.use_decode_moe:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
@@ -263,6 +264,34 @@ class OffloadMoELayer(MoELayer):
             renormalize=self.renormalize,
         )
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
+
+    @contextmanager
+    def prefetch_decode(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        """Yield remapped routes during shared-expert compute; join the fetch on exit."""
+        cache = self.offload_cache
+        batch = get_global_ctx().batch
+        if (cache is None or cache.decode_copy_stream is None or not batch.use_decode_moe
+                or cache.decode_target != "gpu" or cache.is_cpu_layer(self.layer_id)):
+            yield None
+            return
+        routing = fused_topk(hidden_states=hidden_states, gating_output=router_logits,
+                             topk=self.top_k, renormalize=self.renormalize)
+        compute = torch.cuda.current_stream(hidden_states.device)
+        transfer = cache.decode_copy_stream
+        # Fence both routing and the previous layer's cache reads before any eviction.
+        transfer.wait_stream(compute)
+        try:
+            with torch.cuda.stream(transfer):
+                cache.ensure_experts(self.layer_id, routing[1])
+                cache.copy_missing()
+            yield routing
+        finally:
+            # Join even on failure before temporary routing tensors can be recycled.
+            compute.wait_stream(transfer)
+
+    def forward_prefetched(self, hidden_states: torch.Tensor, routing: TopK) -> torch.Tensor:
+        """Consume routes after leaving the prefetch context, without a second lookup."""
+        return self._maybe_all_reduce(self._decode_cached(self.offload_cache, hidden_states, *routing))
 
     def prefill_forward(
         self,
@@ -311,6 +340,9 @@ class OffloadMoELayer(MoELayer):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
+        return self._decode_cached(cache, hidden_states, topk_weights, topk_ids)
+
+    def _decode_cached(self, cache, hidden_states, topk_weights, topk_ids):
         return self._expert_gemm(
             cache,
             hidden_states,

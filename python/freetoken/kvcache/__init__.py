@@ -222,7 +222,10 @@ def create_kvcache_pool(
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
-            num_layers=model_config.num_layers,
+            # Qwen4 MTP adds a full-attention layer after the target decoder's last
+            # layer, so the global KV id range comes from the declared group, not the
+            # target decoder depth.
+            num_layers=max(spec.layer_ids) + 1,
             head_dim=spec.head_dim,
             num_pages=num_pages,
             page_size=page_size,
@@ -233,6 +236,10 @@ def create_kvcache_pool(
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
+            ring_capacity=QSAKVCache.ring_capacity_for(
+                spec.index_ratio,
+                4 * int(getattr(getattr(model_config, "qwen4_args", None), "mtp_num_hidden_layers", 0) > 0),
+            ),
             # Quantizes the KV tiers only -- the compressed index slab the score kernel
             # reads stays the engine dtype (kvcache/qsa_pool.py).
             kv_quant=kv_quant,

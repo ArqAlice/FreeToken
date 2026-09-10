@@ -1,0 +1,48 @@
+[
+  {
+    "seconds": 3.5675625,
+    "prompt": "The capital of France is",
+    "response": {
+      "id": "cmpl-b60e53830b6e4ec9ad31964d70460114",
+      "object": "text_completion",
+      "created": 1788945068,
+      "model": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+      "choices": [
+        {
+          "index": 0,
+          "text": " Paris. Paris is a city. All cities are places. Therefore, the capital of France is a place.",
+          "finish_reason": "stop",
+          "logprobs": null
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 23,
+        "total_tokens": 28
+      }
+    }
+  },
+  {
+    "seconds": 3.834812,
+    "prompt": "Write a Python function that computes Fibonacci numbers.",
+    "response": {
+      "id": "cmpl-69922b25e8b24a6fbee821ccaf9f5bff",
+      "object": "text_completion",
+      "created": 1788945072,
+      "model": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\n\n<think>\nThe user wants a Python function to compute Fibonacci numbers. Let me think about the best approach.\n\nThere are several ways to compute Fibonacci numbers:\n1. Recursive (naive) - O(2^n) time, simple but inefficient\n2. Recursive with memoization - O(n) time\n",
+          "finish_reason": "length",
+          "logprobs": null
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 9,
+        "completion_tokens": 64,
+        "total_tokens": 73
+      }
+    }
+  }
+]

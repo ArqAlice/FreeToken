@@ -1,0 +1,102 @@
+--- before/python/freetoken/scheduler/mtp.py
++++ after/python/freetoken/scheduler/mtp.py
+@@ -30,6 +30,14 @@
+         self._draft_graphs = {}
+         self._sampling_args = {}
+         self._verify_history = None
++        max_drafts = getattr(getattr(scheduler, "config", None), "mtp_speculative_tokens", 4)
++        self._history_steps = min(5, max(2, max_drafts + 1))
++        config = getattr(getattr(self.engine, "config", None), "model_config", None)
++        args = getattr(config, "qwen4_args", None)
++        layers = int(getattr(args, "mtp_num_hidden_layers", 0))
++        self._draft_state_isolated = bool(layers and all(
++            not config.is_linear_layer(lid) and lid not in args.ple_layer_ids
++            for lid in range(config.num_layers, config.num_layers + layers)))
+ 
+     def close(self):
+         self._target_graphs.clear()
+@@ -234,43 +242,54 @@
+             self.engine.cpu_moe_executor.raise_if_unhealthy()
+         return output
+ 
+-    def _snapshot(self, req):
++    def _snapshot(self, req, *, recurrent=True):
+         pool = self.engine.linear_state_pool
+         slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+-        tensors = [pool.conv_states, pool.recurrent_states, *pool.slot_states.values()]
+-        recurrent = [(t, t[:, slot].clone()) for t in tensors]
++        tensors = [pool.conv_states, *([pool.recurrent_states] if recurrent else []), *pool.slot_states.values()]
++        states = [(t, t[:, slot].clone()) for t in tensors]
+         kv = self.engine.kv_cache
+         ring = kv._pending_ring[req.table_idx].clone()
+-        return slot, recurrent, ring
+-
+-    def _restore(self, req, saved):
++        return slot, states, ring
++
++    def _restore(self, req, saved, *, ring_only=False):
+         slot, recurrent, ring = saved
+-        for tensor, value in recurrent:
+-            tensor[:, slot].copy_(value)
++        if not ring_only:
++            for tensor, value in recurrent:
++                tensor[:, slot].copy_(value)
+         self.engine.kv_cache._pending_ring[req.table_idx].copy_(ring)
+         # Speculative KV and compressed rows lie beyond the committed length. They
+         # remain invisible, and the next write replaces them before they become visible.
+ 
+-    def _track_verification(self, batch):
++    def _history_supported(self, num_tokens, use_decode_moe):
+         if os.environ.get("FREETOKEN_MTP_STATE_HISTORY", "1") != "1":
+             return False
+         config = getattr(self.engine, "config", None)
+         args = getattr(getattr(config, "model_config", None), "qwen4_args", None)
+         if args is None:
+             return False
+-        if not batch.use_decode_moe or not 1 <= batch.input_ids.numel() <= 5:
++        if not use_decode_moe or not 1 <= num_tokens <= self._history_steps:
+             return False
+         pool = self.engine.linear_state_pool
+         if set(pool.slot_states) - {"ple_conv", "ple_ngram_ctx"}:
+             return False
++        return True
++
++    def _track_verification(self, batch):
++        ids = getattr(batch, "input_ids", None)
++        if not self._history_supported(ids.numel() if ids is not None else 0,
++                                       getattr(batch, "use_decode_moe", False)):
++            return False
++        args = self.engine.config.model_config.qwen4_args
++        pool = self.engine.linear_state_pool
+         if self._verify_history is None:
+             rec, conv = pool.recurrent_states, pool.conv_states
+-            # Requests run serially; all verification graphs share these five rows.
++            steps = self._history_steps
++            # Allocate for the configured maximum so graph references survive depth changes.
+             self._verify_history = dict(
+-                mtp_recurrent_history=rec.new_empty(rec.shape[0], 1, 5, *rec.shape[2:]),
++                mtp_recurrent_history=rec.new_empty(rec.shape[0], 1, steps, *rec.shape[2:]),
+                 mtp_state_indices=torch.zeros(1, dtype=torch.int32, device=rec.device),
+-                mtp_conv_inputs=conv.new_empty(conv.shape[0], 5, conv.shape[2]),
+-                mtp_ple_inputs={lid: pool.slot_state("ple_conv", lid).new_empty(5, args.ple_state_width)
++                mtp_conv_inputs=conv.new_empty(conv.shape[0], steps, conv.shape[2]),
++                mtp_ple_inputs={lid: pool.slot_state("ple_conv", lid).new_empty(steps, args.ple_state_width)
+                                 for lid in args.ple_layer_ids},
+             )
+         for name, value in self._verify_history.items():
+@@ -337,10 +356,13 @@
+         allocation = copy(req)
+         allocation.cached_len, allocation.device_len = end, end + count
+         self.scheduler.cache_manager.allocate_paged([allocation])
+-        saved = self._snapshot(req)
++        compact = (self._draft_state_isolated
++                   and self._history_supported(ids.numel() + count, start > 0))
++        # Draft QSA does not touch target GDN/PLE; history supplies the committed recurrence.
++        saved = self._snapshot(req, recurrent=not compact)
+         if count > 1:
+             draft, draft_probs = self._lookahead(req, draft, draft_probs, count)
+-            self._restore(req, saved)
++            self._restore(req, saved, ring_only=self._draft_state_isolated)
+         verify_ids = torch.cat((ids, draft))
+         batch = self._batch(req, start, end + count, verify_ids)
+         tracked = self._track_verification(batch)

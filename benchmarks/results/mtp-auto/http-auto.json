@@ -1,0 +1,255 @@
+{
+  "settings": {
+    "url": "http://host.docker.internal:1921",
+    "model": "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+    "prompt": "猫の魅力について熱くたくさん語って。",
+    "tokens": 512,
+    "warmup_tokens": 128,
+    "repeats": 3,
+    "output": "/tmp/mtp-http-auto.json",
+    "validate": true
+  },
+  "runs": [
+    {
+      "repeat": 0,
+      "request": {
+        "model": "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+        "messages": [
+          {
+            "role": "user",
+            "content": "猫の魅力について熱くたくさん語って。"
+          }
+        ],
+        "max_tokens": 512,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "seconds": 13.859355306980433,
+      "ttft_seconds": 2.525474209978711,
+      "delivery_seconds": 11.333124261000194,
+      "delivery_tokens_per_second": 45.089067077334086,
+      "usage": {
+        "prompt_tokens": 61,
+        "completion_tokens": 512,
+        "total_tokens": 573
+      },
+      "finish_reasons": [
+        "length"
+      ],
+      "text": "\n\n猫の魅力？それはもう、語れば語りたいだけ尽きない“究極の癒しと自由の集合体”です！\n\nまず何といっても、猫は“存在そのものが芸術”です。  \nふんわりした肉球、しなやかな体つき、ツヤのある毛並み、宝石のような瞳、ぴくぴく動く耳、ゆらゆら揺れる尻尾。どこを切り取っても絵になるし、寝ているだけで一幅の絵画のようです。\n\nあの丸い顔立ち、小鼻、ヒゲの一本一本にまで個性がある。  \n子猫のふにゃふにゃ感も最高だけど、成猫の堂々たる美しさもまた格別。老猫の穏やかな表情には、岁月を重ねた風格がある。本当に「生命の美」を凝縮したような存在です。\n\n---\n\n## 1. 肉球が世界一の正義\n\n猫の肉球。あれは反則です。  \nふわふわ、もちもち、ぽってり。押すとほんのり柔らかくて、まるで極上のマシュマロ。  \n足裏のピンク色、黒い子の子猫の鼻先みたいな色、指先の分け目、あの小さな爪。すべてが愛おしい。\n\n肉球を見せながら仰向けになる猫、肉球で顔に手を添えて寝る猫、踏んでくれる猫、お顔に乗ってくる猫……あの感触にノックアウトされない人間はそういないでしょう。\n\n肉球を「ペタッ」とやられると、一日の疲れが吹き飛びます。  \nあれはもう、触診というより“癒しの儀式”。\n\n---\n\n## 2. 瞳が神秘的すぎる\n\n猫の瞳は本当に美しい。  \n緑、金、青、銅、アンバー、オ",
+      "reasoning": "We need to respond in Japanese, user asks \"猫の魅力について熱くたくさん語って。\" Need to provide passionate, many points about cats' charm. Need maybe direct answer. Ensure not too short. Could structure with headings, lots of details. Need final only. Let's craft enthusiastic Japanese. Include physical traits, behavior, communication, companionship, quirks, sensory appeal, therapeutic effects, artistic/cultural, conclusion. Use lively tone, maybe exclamation. But \"熱くたくさん\" means many. Could be long. Let's produce detailed list, paragraphs. Ensure natural Japanese. Avoid overdoing maybe. Need no citations.\n"
+    },
+    {
+      "repeat": 1,
+      "request": {
+        "model": "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+        "messages": [
+          {
+            "role": "user",
+            "content": "猫の魅力について熱くたくさん語って。"
+          }
+        ],
+        "max_tokens": 512,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "seconds": 13.479725181008689,
+      "ttft_seconds": 2.513871011993615,
+      "delivery_seconds": 10.964921378006693,
+      "delivery_tokens_per_second": 46.60316133455892,
+      "usage": {
+        "prompt_tokens": 61,
+        "completion_tokens": 512,
+        "total_tokens": 573
+      },
+      "finish_reasons": [
+        "length"
+      ],
+      "text": "\n\n猫の魅力——それ語らせたら、おそらく人類史上もっとも熱く、もっともふんわりとしたテーマになる。\n\n猫の一番の魅力は、まず「存在そのものが芸術品」なところ。  \nあの小顔、大きな瞳、三角形の耳、ふわりとした毛並み、細くしなやかな足、そしてあの尻尾。  \n何を隠そう、あの仕草ひとつで世界を支配してしまうのが猫という生き物。\n\nまず、顔。  \n猫の顔は本当にずるい。  \n無表情なのに、どこか上品で、ちょっと冷たくて、でも目が合った瞬間に「あっ、こっち見てる……」と心臓がきゅっとなる。  \n大きく見開いた目には、まるで小宇宙が宿っているよう。  \n瞳孔が丸くなるのも細くなるのも可愛い。  \nまばたきがゆっくりな瞬間に至っては、もう「許された」と感じる。  \n猫の瞬きは、人に対する最大の信頼表現であり、愛の宣言である。\n\nそして耳。  \nピクッ、ピクッ、シュッ、と動くあの耳。  \n音に反応して、ちょっとだけこちらに傾ける仕草。  \nもう最高。  \n耳が前を向いていたら好奇心全開。  \n耳をペタンと倒したら警戒。  \nあの耳の角度だけで感情が読めるのが猫の会話の面白さ。\n\n毛並みもたまらない。  \nふわっ、すべすべ、なめらか、もふもふ、ざっくり、つややか。  \n猫の種類によって手触りが全然違うのも魅力。  \n短毛のツルッツル感、長毛のモフモフ感、三毛の色彩の複雑さ、虎模様の繊細さ、白猫の神々しさ。",
+      "reasoning": "We need answer user in Japanese. User: \"猫の魅力について熱くたくさん語って。\" Need provide enthusiastic, many details about cat charms. Final only Japanese answer likely. Should be hot, lots. Could structure sections. Ensure no factual issues. Let's craft detailed, affectionate, maybe humorous. Include physical traits, behavior, purr, softness, independence, hunting, expressions, sounds, tail, paws, loaf, zoomies, sunbathing, bonding, health benefits, variety of cats, poetic. Maybe long. Need no citations. Final answer in Japanese with enthusiastic tone. Could be several paragraphs/bullets. Let's write comprehensive.\n"
+    },
+    {
+      "repeat": 2,
+      "request": {
+        "model": "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+        "messages": [
+          {
+            "role": "user",
+            "content": "猫の魅力について熱くたくさん語って。"
+          }
+        ],
+        "max_tokens": 512,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "seconds": 14.880704248003894,
+      "ttft_seconds": 2.525503145996481,
+      "delivery_seconds": 12.354250764998142,
+      "delivery_tokens_per_second": 41.362281672941,
+      "usage": {
+        "prompt_tokens": 61,
+        "completion_tokens": 512,
+        "total_tokens": 573
+      },
+      "finish_reasons": [
+        "length"
+      ],
+      "text": "\n\n猫の魅力、語らせたらもう止まりません。\n\nまず猫の魅力は、**「存在そのものが芸術作品」**であることです。  \nあのしなやかな身体、流れるような被毛、澄んだ瞳、小さく愛らしい肉球、ぴくぴく動く耳、优雅な尾。どれひとつとっても「なぜこんなに完璧なんだ？」とため息が出ます。  \n猫が歩いているだけで、まるで小さな神様が部屋の中を通過しているかのような気配があります。  \nあれだけ気ままに生きながら、なぜあれほど美しいのか。本当にずるい動物です。\n\n猫の最大の魅力の一つは、**「ツンデレの完成形」**であることです。  \nこちらは必死に構っても、プイッと横を向いてしまう。  \n「ふん、人間など信用ならぬ」とでも言いたげな冷たい視線。  \nでもふと、こちらが忙しくしているとき、静かに膝の上に乗ってきたり、側で丸まってくれたりする。  \nその瞬間、「あ、この子は自分を選んでくれているんだ」と胸が熱くなります。  \n猫は簡単には心を許さない。",
+      "reasoning": "We need to respond to user: \"猫の魅力について熱くたくさん語って。\" Japanese request: \"Talk passionately and a lot about the charms of cats.\" We already called thinker. Need final in Japanese. Need produce extensive enthusiastic answer about cats' charm. User language Japanese. Final should be Japanese, maybe long, passionate, many points. Need ensure maybe no analysis in final. Could include structure. Need satisfy \"熱くたくさん\". Let's craft long, emotive, detailed, maybe bullet points but also prose. Maybe mention purr, independent yet dependent, eyes, movements, paws, whiskers, sleeping, hunting, mystery, companionship, quirks, science, cultural. Could be around 1000-2000 Japanese chars. Need maybe use emojis? Cat charm. Ensure not too much. Let's produce final with headings? User asked talk hot. Could be one passionate monologue. Let's do long, with lists maybe \"猫の魅力、語らせたら止まりません!\" and many items. Need perhaps avoid overly formulaic. Include \"熱く\" tone. Let's write in natural Japanese. Also maybe mention if they want I can continue. But final only answer. Let's produce about 1500 chars? Desired oververbosity 9, so detailed. Let's craft rich.\n"
+    }
+  ],
+  "warmup": {
+    "request": {
+      "model": "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+      "messages": [
+        {
+          "role": "user",
+          "content": "猫の魅力について熱くたくさん語って。"
+        }
+      ],
+      "max_tokens": 128,
+      "stream": true,
+      "stream_options": {
+        "include_usage": true
+      }
+    },
+    "seconds": 7.696622477000346,
+    "ttft_seconds": 3.9199125659943093,
+    "delivery_seconds": 3.7758506269892678,
+    "delivery_tokens_per_second": 33.634805119731496,
+    "usage": {
+      "prompt_tokens": 61,
+      "completion_tokens": 128,
+      "total_tokens": 189
+    },
+    "finish_reasons": [
+      "length"
+    ],
+    "text": "\n\nもちろん！猫の魅力？語らせたら止まり",
+    "reasoning": "We need to respond in Japanese to user: \"猫の魅力について熱くたくさん語って。\" Means \"Talk passionately and a lot about the charm of cats.\" Need produce final answer. Need ensure maybe in Japanese. Need answer enthusiastically, many points. Could be long. No special constraints. Let's craft with headings, vivid language, maybe mention physical traits, behavior, emotional effects, cultural, daily observations. Need maybe avoid too formal? User asks 熱くたくさん語って. So we can write a passionate essay/list. Include many charming points. Final only.\n"
+  },
+  "validation": {
+    "stop_marker": "er in Japane",
+    "stop_response": {
+      "id": "chatcmpl-5",
+      "object": "chat.completion",
+      "created": 1788997833,
+      "model": "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "We need answ"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 61,
+        "completion_tokens": 5,
+        "total_tokens": 66
+      }
+    },
+    "aborted_text_events": 32,
+    "abort_recovery": {
+      "request": {
+        "model": "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+        "messages": [
+          {
+            "role": "user",
+            "content": "猫の魅力について熱くたくさん語って。"
+          }
+        ],
+        "max_tokens": 64,
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        }
+      },
+      "seconds": 4.269754902023124,
+      "ttft_seconds": 2.521766412013676,
+      "delivery_seconds": 1.7470518419868313,
+      "delivery_tokens_per_second": 36.06075016546354,
+      "usage": {
+        "prompt_tokens": 61,
+        "completion_tokens": 64,
+        "total_tokens": 125
+      },
+      "finish_reasons": [
+        "length"
+      ],
+      "text": "",
+      "reasoning": "We need to respond to user in Japanese: \"猫の魅力について熱くたくさん語って。\" They want us to talk passionately and at length about the charm of cats. Need final answer only. Must be in Japanese likely. Need produce detailed enthusiastic essay. Could include sections, examples, reasons. Ensure not too short"
+    },
+    "concurrent": [
+      {
+        "request": {
+          "model": "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+          "messages": [
+            {
+              "role": "user",
+              "content": "猫の魅力について熱くたくさん語って。"
+            }
+          ],
+          "max_tokens": 128,
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        },
+        "seconds": 9.998407142003998,
+        "ttft_seconds": 5.0213829330168664,
+        "delivery_seconds": 4.976241868978832,
+        "delivery_tokens_per_second": 25.52126752353006,
+        "usage": {
+          "prompt_tokens": 61,
+          "completion_tokens": 128,
+          "total_tokens": 189
+        },
+        "finish_reasons": [
+          "length"
+        ],
+        "text": "",
+        "reasoning": "ユーザーは日本語で「猫の魅力について熱くたくさん語って。」と依頼している。求めるのは熱く、たくさん、猫の魅力についての語りである。最終回答は日本語で、情熱的かつ量多めにする。構成としては導入、外見、動き、鳴き声、性格、生活の中の魅力、文化的・科学的な魅力、共感、締めなど。熱く語りつつ、偏りすぎない。猫の特性として、肉球、尻尾、瞬き、ゴロゴロ、ツンデレ、狩猟本能、猫背、高い跳躍力、柔らかな体、目、"
+      },
+      {
+        "request": {
+          "model": "Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+          "messages": [
+            {
+              "role": "user",
+              "content": "猫の魅力について熱くたくさん語って。"
+            }
+          ],
+          "max_tokens": 128,
+          "stream": true,
+          "stream_options": {
+            "include_usage": true
+          }
+        },
+        "seconds": 10.016314745007548,
+        "ttft_seconds": 2.5093663920124527,
+        "delivery_seconds": 7.506368816975737,
+        "delivery_tokens_per_second": 16.918966160147644,
+        "usage": {
+          "prompt_tokens": 61,
+          "completion_tokens": 128,
+          "total_tokens": 189
+        },
+        "finish_reasons": [
+          "length"
+        ],
+        "text": "\n\n猫の魅力？ もう語れば語っても語り足りない。世界は猫でできている、と本気で思わせるほど、猫は私たちの心を掴",
+        "reasoning": "We need answer in Japanese. User: \"猫の魅力について熱くたくさん語って。\" Need produce enthusiastic long response about cat charm. Need final only. Ensure no hidden issues. Could structure with sections, passion. Let's craft a detailed, warm, fun essay. Include cat features, behaviors, sensory appeal, emotional bond, quirks, philosophy. Maybe \"熱く\" means energetic. Japanese with exclamations. Let's produce lengthy but not too insane.\n"
+      }
+    ]
+  }
+}

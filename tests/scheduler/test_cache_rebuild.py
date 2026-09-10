@@ -150,8 +150,10 @@ def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
     sched.decode_manager = SimpleNamespace(runnable=False)
     sched.device = torch.device("cpu")
     sched.config = SimpleNamespace(tp_info=SimpleNamespace(size=1), max_extend_tokens=100_000)
+    lifecycle = []
+    sched._mtp_runner = SimpleNamespace(close=lambda: lifecycle.append("release_mtp_graphs"))
     sched.engine = SimpleNamespace(
-        rebuild_runtime_cache=lambda **kw: None, num_pages=32, page_table=None
+        rebuild_runtime_cache=lambda **kw: lifecycle.append("rebuild"), num_pages=32, page_table=None
     )
     # engine.page_table unchanged across the (stubbed) rebuild -> no token_pool re-point.
     sched.table_manager = SimpleNamespace(page_table=None)
@@ -168,3 +170,4 @@ def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
     cache_manager.prefill_chunk_budget = 1000  # the (stubbed) engine rebuild shrank the pool
     Scheduler.rebuild_cache(sched, num_pages=16)
     assert sched.prefill_budget == 1000  # tracks the shrunk cap, not the stale 5000
+    assert lifecycle == ["release_mtp_graphs", "rebuild"]

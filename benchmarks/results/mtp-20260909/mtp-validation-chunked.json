@@ -1,0 +1,19 @@
+{
+  "id": "cmpl-4064cbd7a2634d969c410eed02fc09e3",
+  "object": "text_completion",
+  "created": 1788944873,
+  "model": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+  "choices": [
+    {
+      "index": 0,
+      "text": " four five six seven",
+      "finish_reason": "length",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 145,
+    "completion_tokens": 4,
+    "total_tokens": 149
+  }
+}

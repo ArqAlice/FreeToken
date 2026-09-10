@@ -1,0 +1,10 @@
+Final GPU regression, 2026-09-09 UTC
+Container: freetoken-mtp-dev, RTX 5090, driver 591.86
+PYTHONPATH=/opt/freetoken/python
+Default shared-row NVFP4 and arithmetic NVFP4 MoE enabled.
+
+Command inside /opt/freetoken:
+/opt/venv/bin/python -m pytest -p no:cacheprovider -q tests/scheduler tests/engine/test_speculative.py tests/engine/test_kv_quant_config.py tests/layers/test_linear_mtp.py tests/models/qwen4_exp/test_config.py tests/models/qwen4_exp/test_gdn.py tests/models/qwen4_exp/test_ple.py tests/models/qwen4_exp/test_ple_disk.py tests/models/qwen4_exp/test_skeleton.py tests/models/qwen4_exp/test_weight.py tests/models/qwen4_exp/test_qsa_backend.py tests/models/qwen4_exp/test_qsa_kernels.py tests/kvcache/test_qsa_pool.py tests/kvcache/test_qsa_pool_fp8.py tests/kernels/test_qsa_fp8.py tests/kernels/test_qsa_nvfp4.py tests/tokenizer/test_detokenize.py tests/moe/test_nvfp4_backends.py
+
+Final pytest output:
+546 passed, 8 skipped in 103.30s (0:01:43)

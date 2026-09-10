@@ -1,0 +1,64 @@
+{
+  "copy_calls": 3413,
+  "copy_streams": {
+    "13": 264,
+    "248": 3055,
+    "302": 47,
+    "198": 47
+  },
+  "copy_kernel_seconds": 2.625148414,
+  "copy_union_seconds": 2.6251484296875,
+  "overlap_with_other_kernels_seconds": 0.7022031220703125,
+  "overlapping_kernels": [
+    {
+      "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, false, true, true, false, 7, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>)",
+      "calls": 12397,
+      "overlap_us": 321214.775390625
+    },
+    {
+      "name": "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, float, false, true, true, false, 6, false, cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float> >(cublasGemvParamsEx<int, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16 const>, cublasGemvTensorStridedBatched<__nv_bfloat16>, float>)",
+      "calls": 8182,
+      "overlap_us": 229900.2705078125
+    },
+    {
+      "name": "void flashinfer::activation::act_and_mul_kernel<__nv_bfloat16, &(silu(float const&))>(__nv_bfloat16*, __nv_bfloat16 const*, int)",
+      "calls": 3135,
+      "overlap_us": 163468.103515625
+    },
+    {
+      "name": "_gate_sigmoid_kernel",
+      "calls": 3287,
+      "overlap_us": 115965.4716796875
+    },
+    {
+      "name": "_nvfp4_gemv_splitk_kernel",
+      "calls": 111,
+      "overlap_us": 1207.064453125
+    },
+    {
+      "name": "_nvfp4_gemm_splitk_reduce_kernel",
+      "calls": 38,
+      "overlap_us": 823.76953125
+    },
+    {
+      "name": "_lru_ensure_kernel",
+      "calls": 2312,
+      "overlap_us": 232.51953125
+    },
+    {
+      "name": "_nvfp4_gemm_kernel",
+      "calls": 34,
+      "overlap_us": 215.78125
+    },
+    {
+      "name": "_decode_nvfp4_marlin_kernel",
+      "calls": 5,
+      "overlap_us": 0.5107421875
+    }
+  ],
+  "notes": [
+    "Intervals come from a separate instrumented 128-token generation.",
+    "Overlap is observed device execution time, not a predicted end-to-end speedup.",
+    "Memcpy events and prefill transfer time are excluded."
+  ]
+}

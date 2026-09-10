@@ -1,0 +1,516 @@
+--- a/python/freetoken/engine/config.py
++++ b/python/freetoken/engine/config.py
+@@ -89,6 +89,7 @@
+     # is final. Mutually exclusive with num_page_override.
+     num_token_override: int | None = None
+     mtp_speculative_tokens: int = 0
++    mtp_auto: bool = False
+ 
+     @cached_property
+     def hf_config(self):
+--- a/python/freetoken/engine/engine.py
++++ b/python/freetoken/engine/engine.py
+@@ -206,6 +206,11 @@
+     model_config = config.model_config
+     if getattr(config, "mtp_speculative_tokens", 0) not in range(5):
+         raise ValueError("--mtp-speculative-tokens supports integers from 0 through 4")
++    if getattr(config, "mtp_auto", False):
++        if not getattr(config, "mtp_speculative_tokens", 0):
++            raise ValueError("--mtp-auto requires --mtp-speculative-tokens 1-4")
++        if getattr(getattr(config, "tp_info", None), "size", 1) != 1:
++            raise ValueError("--mtp-auto currently requires tensor parallel size 1")
+     if getattr(config, "mtp_speculative_tokens", 0) and not int(
+         getattr(getattr(model_config, "qwen4_args", None), "mtp_num_hidden_layers", 0) or 0
+     ):
+@@ -488,6 +493,7 @@
+             vocab_size=config.model_config.vocab_size,
+             dummy_req=self.dummy_req,
+             moe_offload_cache=self.moe_offload_cache,
++            capture_target_residual=config.mtp_auto,
+         )
+         if config.attention_backend.split(",")[0] == "triton":
+             # Prefill runs on the first comma part; warm its autotune cache.
+@@ -981,13 +987,23 @@
+             vocab_size=config.model_config.vocab_size,
+             dummy_req=self.dummy_req,
+             moe_offload_cache=self.moe_offload_cache,
++            capture_target_residual=config.mtp_auto,
+         )
+ 
+     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+         assert torch.cuda.current_stream() == self.stream
+         use_graph = self.graph_runner.can_use_cuda_graph(batch)
++        residual = getattr(batch, "mtp_return_residual", False)
++        self.mtp_target_residual = None
+         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
+-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
++            if use_graph:
++                logits = self.graph_runner.replay(batch)
++                if residual:
++                    self.mtp_target_residual = self.graph_runner.target_residuals[batch.padded_size][:batch.size]
++            elif residual:
++                logits, self.mtp_target_residual = self.model.forward_with_target_residual()
++            else:
++                logits = self.model.forward()
+         if self.cpu_moe_executor is not None:
+             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
+             # -> stale expert outputs) as a loud error instead of silent corruption.
+--- a/python/freetoken/engine/graph.py
++++ b/python/freetoken/engine/graph.py
+@@ -105,6 +105,7 @@
+         vocab_size: int,
+         dummy_req: Req,
+         moe_offload_cache: OffloadMoeCache | None = None,
++        capture_target_residual: bool = False,
+     ) -> None:
+         cuda_graph_bs = _determine_cuda_graph_bs(
+             cuda_graph_bs=cuda_graph_bs,
+@@ -118,6 +119,8 @@
+         self.moe_offload_cache = moe_offload_cache
+         self.stream = stream
+         self.device = device
++        self.capture_target_residual = capture_target_residual
++        self.target_residuals = {}
+         self._capture_graphs(max_seq_len, vocab_size, model)
+ 
+     def _reset_moe_offload_cache(self) -> None:
+@@ -176,7 +179,12 @@
+                 # Keep the offload cache warmed for capture. Resetting here forces
+                 # CUDA graph capture to replay cold-cache expert copies.
+                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+-                    self.buffer.logits[:bs] = model.forward()
++                    if self.capture_target_residual:
++                        logits, residual = model.forward_with_target_residual()
++                        self.target_residuals[bs] = residual
++                        self.buffer.logits[:bs] = logits
++                    else:
++                        self.buffer.logits[:bs] = model.forward()
+                 self._reset_moe_offload_cache()
+             if pool is None:
+                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
+@@ -213,5 +221,6 @@
+         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
+         # caller / next capture (GraphRunner._capture_graphs already runs it).
+         self.graph_map = {}
++        self.target_residuals = {}
+         self.buffer = None
+         gc.collect()
+--- a/python/freetoken/models/qwen4_exp/ple_disk.py
++++ b/python/freetoken/models/qwen4_exp/ple_disk.py
+@@ -214,30 +214,20 @@
+         if getattr(batch, "ple_input_ids", None) is not None:
+             prefix = batch.ple_prefix_ids.to(torch.int64)
+             padding = prefix.new_full((2 - prefix.numel(),), eos)
+-            self.fill([torch.cat((padding, prefix, batch.ple_input_ids.to(torch.int64)))], graph=use_graph)
++            def fill_tokens(tokens):
++                self.fill([torch.cat((padding, prefix, tokens))], graph=use_graph)
++            if use_graph and batch.ple_input_ids.is_cuda and self._wait_sync:
++                return self._defer_tokens(batch.ple_input_ids, fill_tokens)
++            fill_tokens(batch.ple_input_ids.to(device="cpu", dtype=torch.int64))
+             return None
+         if batch.is_decode:
+             reqs = list(batch.reqs)
+             if use_graph and self._wait_sync:
+-                bs = batch.padded_size
+-                self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
+-                self._readback_event.record(torch.cuda.current_stream(self._device))
+-
+-                def _complete() -> None:
+-                    try:
+-                        self._readback_event.synchronize()
+-                        tokens = self._token_readback[:bs].to(torch.int64).tolist()
+-                        runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
+-                                for r, t in zip(reqs, tokens)]
+-                        self.fill(runs, graph=True)
+-                    except BaseException:
+-                        from freetoken.kernel import _ple_store
+-
+-                        # unblock the stream before surfacing; the step's output is discarded
+-                        _ple_store.signal_flag(self._flag.data_ptr())
+-                        raise
+-
+-                return _complete
++                def fill_tokens(tokens):
++                    runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
++                            for r, t in zip(reqs, tokens.tolist())]
++                    self.fill(runs, graph=True)
++                return self._defer_tokens(batch.input_ids, fill_tokens)
+             # launch-gating: this D2H is the step's readback and orders the fill after sampling
+             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
+             runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
+@@ -254,6 +244,23 @@
+         self.fill(runs, graph=use_graph)
+         return None
+ 
++    def _defer_tokens(self, ids, consume):
++        count = ids.numel()
++        self._token_readback[:count].copy_(ids, non_blocking=True)
++        self._readback_event.record(torch.cuda.current_stream(self._device))
++
++        def complete():
++            try:
++                self._readback_event.synchronize()
++                consume(self._token_readback[:count].to(torch.int64))
++            except BaseException:
++                from freetoken.kernel import _ple_store
++
++                # Unblock a dispatched graph before propagating a disk/readback failure.
++                _ple_store.signal_flag(self._flag.data_ptr())
++                raise
++        return complete
++
+     @contextmanager
+     def forward_host_ctx(self, batch: Batch, use_graph: bool):
+         """Around one dispatch: stage on enter, run the deferred fill+signal on exit."""
+--- a/python/freetoken/scheduler/mtp.py
++++ b/python/freetoken/scheduler/mtp.py
+@@ -1,7 +1,9 @@
+ """MTP verification with speculative sampling and recurrent-state rollback."""
+ 
+ from copy import copy
++from collections import deque
+ import os
++import time
+ 
+ import torch
+ 
+@@ -11,6 +13,7 @@
+ from freetoken.utils import div_ceil, init_logger
+ 
+ from .prefill import ChunkedReq
++from .mtp_policy import MTPPolicy
+ 
+ logger = init_logger(__name__)
+ 
+@@ -26,6 +29,9 @@
+         self.proposed = 0
+         self.accepted = 0
+         self.acceptance_lengths = {}
++        self._policies = {}
++        self._timings = deque()
++        self.auto_stats = {}
+         self._target_graphs = {}
+         self._draft_graphs = {}
+         self._sampling_args = {}
+@@ -52,7 +58,79 @@
+             self._qsa_layers = range(config.num_layers, config.num_layers + layers)
+             self._qsa_ring = self.engine.kv_cache.ring_capacity
+ 
++    def _auto_enabled(self):
++        return getattr(getattr(self.scheduler, "config", None), "mtp_auto", False)
++
++    def _policy(self, req):
++        policy = self._policies.get(req.uid)
++        if policy is None:
++            policy = MTPPolicy(max_depth=min(3, self.scheduler.config.mtp_speculative_tokens))
++            self._policies[req.uid] = policy
++        policy.context(req.cached_len)
++        return policy
++
++    def _depth(self, req):
++        if self._auto_enabled():
++            return self._policy(req).depth
++        return getattr(getattr(self.scheduler, "config", None), "mtp_speculative_tokens", 1)
++
++    def _drain_timings(self):
++        while self._timings and self._timings[0][-1].query():
++            uid, bucket, depth, emitted, host, captured, begin, baseline, end = self._timings.popleft()
++            elapsed = max(host, begin.elapsed_time(end) / 1000)
++            row = self.auto_stats.setdefault(depth, dict(cycles=0, tokens=0, seconds=0.,
++                                                        capture_seconds=0., probe_seconds=0.))
++            row["cycles"] += 1
++            row["tokens"] += emitted
++            row["seconds"] += elapsed
++            if captured:
++                row["capture_seconds"] += elapsed
++                continue
++            cost = elapsed
++            if baseline is not None:
++                cost = max(host, begin.elapsed_time(baseline) / 1000)
++                row["probe_seconds"] += max(0., elapsed - cost)
++            subjects = uid if isinstance(uid, list) else [(uid, bucket)]
++            for request_id, request_bucket in subjects:
++                self._observe_timing(request_id, request_bucket, depth, cost, emitted)
++
++    def _observe_timing(self, uid, bucket, depth, cost, emitted):
++        policy = self._policies.get(uid)
++        if policy is not None and policy.bucket == bucket and not policy.stopped:
++            before = policy.depth
++            policy.observe(depth, cost, emitted)
++            if policy.depth != before:
++                self._qsa_owner = None
++                if policy.stopped:
++                    for values in (self.drafts, self.draft_probs, self.draft_states, self.pending):
++                        values.pop(uid, None)
++                logger.info_rank0(f"MTP auto request={uid}: depth {before}->{policy.depth}, ms/token="
++                                  + str({k: round(v * 1000, 2) for k, v in policy.costs.items()}))
++
++    def _timed_one(self, req, phase):
++        if not self._auto_enabled() or phase != "decode":
++            return self._one(req, phase)
++        policy = self._policy(req)
++        if policy.depth == 0:
++            batch = Batch([req], phase="decode")
++            inputs = self.scheduler._prepare_batch(batch, allocate=False)
++            return self._normal(inputs).next_tokens_gpu
++        depth, bucket = policy.depth, policy.bucket
++        graphs = len(self._target_graphs), len(self._draft_graphs)
++        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        begin.record(self.engine.stream)
++        started = time.perf_counter()
++        tokens = self._one(req, phase)
++        host = time.perf_counter() - started
++        end.record(self.engine.stream)
++        captured = graphs != (len(self._target_graphs), len(self._draft_graphs))
++        self._timings.append((req.uid, bucket, depth, tokens.numel(), host, captured,
++                              begin, None, end))
++        return tokens
++
+     def close(self):
++        self._timings.clear()
++        self._policies.clear()
+         self._target_graphs.clear()
+         self._draft_graphs.clear()
+         self._verify_history = None
+@@ -60,6 +138,8 @@
+         self._qsa_owner = None
+ 
+     def forget(self, uid):
++        self._drain_timings()
++        self._policies.pop(uid, None)
+         if self._qsa_owner is not None and self._qsa_owner[0] == uid:
+             self._qsa_owner = None
+         self.drafts.pop(uid, None)
+@@ -88,10 +168,12 @@
+             and req.sampling_params.temperature > 0 and req.sampling_params.top_k != 1
+             and os.environ.get("FREETOKEN_MTP_BATCHED_LINEAR", "0") == "1"
+         )
+-        if host_input:
++        disk_ple = getattr(getattr(self.engine, "config", None), "ple_backend", "disk") == "disk"
++        if host_input and disk_ple:
+             # Disk PLE needs only two history tokens, not a copy of the entire prompt.
+             batch.ple_prefix_ids = req.input_ids[max(0, start - 2):start]
+-            batch.ple_input_ids = input_ids.to("cpu")
++            batch.ple_input_ids = (input_ids if os.environ.get("FREETOKEN_MTP_ASYNC_PLE", "1") == "1"
++                                   else input_ids.to("cpu"))
+         # Tiny verification batches need routed experts only, not a full layer transfer.
+         batch.use_decode_moe = start > 0 and input_ids.numel() <= 5
+         self.scheduler._prepare_batch(batch, allocate=False, sample=False)
+@@ -118,7 +200,8 @@
+                table.shape[1] if table is not None else 0,
+                getattr(batch, "mtp_recurrent_history", None) is not None,
+                getattr(batch, "mtp_batched_linear", False))
+-        if key not in self._target_graphs:
++        first_replay = key not in self._target_graphs
++        if first_replay:
+             # Warm kernels on the live slot, then undo recurrent writes before replay.
+             # KV writes are at these same positions and are overwritten by the replay.
+             saved = self._snapshot(batch.reqs[0])
+@@ -132,7 +215,12 @@
+             self._target_graphs[key] = (graph, static, bindings, output)
+         graph, static, bindings, output = self._target_graphs[key]
+         self._stage_batch(batch, static, bindings)
+-        with self.engine.model.forward_host_ctx(batch, True):
++        host_batch = batch
++        if first_replay and getattr(batch, "ple_input_ids", None) is not None:
++            # First launch can block before deferred fill can signal the graph's PLE wait.
++            host_batch = copy(batch)
++            host_batch.ple_input_ids = batch.ple_input_ids.to("cpu")
++        with self.engine.model.forward_host_ctx(host_batch, True):
+             graph.replay()
+         if self.engine.cpu_moe_executor is not None:
+             self.engine.cpu_moe_executor.raise_if_unhealthy()
+@@ -168,6 +256,12 @@
+             getattr(owner, name).copy_(getattr(source, name))
+ 
+     def _draft(self, req, start, residual, input_ids, next_token, batch=None):
++        if self._auto_enabled() and self._policy(req).stopped:
++            self.drafts.pop(req.uid, None)
++            self.draft_probs.pop(req.uid, None)
++            self.draft_states.pop(req.uid, None)
++            self.pending.pop(req.uid, None)
++            return
+         if next_token is not None and getattr(req, "remain_len", 1) == 0:
+             return
+         previous = self.pending.pop(req.uid, None)
+@@ -192,7 +286,18 @@
+             batch = copy(batch)
+             for name in ("mtp_recurrent_history", "mtp_state_indices", "mtp_conv_inputs", "mtp_ple_inputs"):
+                 setattr(batch, name, None)
+-        logits, hidden = self._head(shifted, states, batch, compute_logits=next_token is not None)
++        proposal = next_token is not None
++        if proposal and self._auto_enabled():
++            policy = self._policy(req)
++            if policy.depth == 0:
++                proposal = (policy.warmup >= policy.warmup_samples
++                            and policy.samples.get(0, 0) >= policy.min_samples - 1)
++        logits, hidden = self._head(shifted, states, batch, compute_logits=proposal)
++        if not proposal:
++            self.drafts.pop(req.uid, None)
++            self.draft_probs.pop(req.uid, None)
++            self.draft_states.pop(req.uid, None)
++            return
+         if next_token is not None and getattr(getattr(self.scheduler, "config", None), "mtp_speculative_tokens", 1) > 1:
+             self.draft_states[req.uid] = hidden[-1:].clone()
+         if next_token is not None:
+@@ -378,9 +483,10 @@
+         greedy = req.sampling_params.is_greedy
+         draft = self.drafts.pop(req.uid, None)
+         draft_probs = self.draft_probs.pop(req.uid, None)
+-        speculate = phase == "decode" and draft is not None and req.remain_len >= 2
++        depth = self._depth(req)
++        speculate = phase == "decode" and draft is not None and req.remain_len >= 2 and depth > 0
+         if speculate:
+-            count = min(getattr(self.scheduler.config, "mtp_speculative_tokens", 1), req.remain_len - 1)
++            count = min(depth, req.remain_len - 1)
+             ps = self.scheduler.config.page_size
+             capacity = (div_ceil(end, ps) + len(self.scheduler.cache_manager.free_slots)) * ps
+             count = min(count, capacity - end)
+@@ -464,7 +570,13 @@
+ 
+     def forward(self, forward_input):
+         batch = forward_input.batch
+-        rows = [self._one(req, batch.phase) for req in batch.reqs]
++        self._drain_timings()
++        if self._auto_enabled() and batch.phase == "decode":
++            # Keep greedy's single-row reduction order across depth and batch changes.
++            batch_zero = batch.size == 1 or not any(r.sampling_params.is_greedy for r in batch.reqs)
++            if batch_zero and all(self._depth(r) == 0 for r in batch.reqs):
++                return self._normal(forward_input)
++        rows = [self._timed_one(req, batch.phase) for req in batch.reqs]
+         width = self.scheduler.config.mtp_speculative_tokens + 1
+         tokens = torch.full((batch.size, width), -1, dtype=torch.int32, device=self.engine.device)
+         for i, row in enumerate(rows):
+@@ -474,3 +586,28 @@
+         event.record(self.engine.stream)
+         self.scheduler.decode_manager.filter_reqs(batch.reqs)
+         return ForwardOutput(tokens, host, event)
++
++    def _normal(self, forward_input):
++        batch = forward_input.batch
++        policies = [self._policy(r) for r in batch.reqs]
++        batch.mtp_return_residual = any(not p.stopped for p in policies)
++        graphs = len(self._draft_graphs)
++        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
++        begin.record(self.engine.stream)
++        before = time.perf_counter()
++        result = self.scheduler._forward_standard(forward_input)
++        host = time.perf_counter() - before
++        baseline = torch.cuda.Event(enable_timing=True)
++        baseline.record(self.engine.stream)
++        for i, (req, policy) in enumerate(zip(batch.reqs, policies)):
++            if not policy.stopped:
++                self._draft(req, req.cached_len - 1, self.engine.mtp_target_residual[i:i + 1],
++                            batch.input_ids[i:i + 1], result.next_tokens_gpu[i])
++        self.engine.mtp_target_residual = None
++        end.record(self.engine.stream)
++        captured = graphs != len(self._draft_graphs)
++        # Amortize the ordinary batched decode cost across its emitted tokens.
++        subjects = [(r.uid, p.bucket) for r, p in zip(batch.reqs, policies) if not p.stopped]
++        self._timings.append((subjects, None, 0 if subjects else "stopped",
++                              batch.size, host, captured, begin, baseline if subjects else None, end))
++        return result._replace(copy_done_event=end)
+--- /dev/null
++++ b/python/freetoken/scheduler/mtp_policy.py
+@@ -0,0 +1,78 @@
++"""Per-request MTP depth selection from completed-cycle timings."""
++
++from dataclasses import dataclass, field
++
++
++@dataclass
++class MTPPolicy:
++    max_depth: int = 3
++    min_samples: int = 4
++    warmup_samples: int = 16
++    depth: int = 0
++    stopped: bool = False
++    bucket: int | None = None
++    costs: dict = field(default_factory=dict)
++    samples: dict = field(default_factory=dict)
++    probing: bool = True
++    updates: int = 0
++    warmup: int = 0
++    baseline_age: int = 0
++    elapsed: dict = field(default_factory=dict)
++    emitted: dict = field(default_factory=dict)
++
++    def context(self, position):
++        bucket = position // 8192
++        if self.bucket != bucket and not self.stopped:
++            self.bucket = bucket
++            self.costs.clear()
++            self.samples.clear()
++            self.elapsed.clear()
++            self.emitted.clear()
++            self.depth, self.probing, self.updates = 0, True, 0
++            self.warmup, self.baseline_age = 0, 0
++
++    def observe(self, depth, seconds, emitted):
++        if self.stopped or emitted <= 0 or seconds <= 0:
++            return
++        if depth == 0 and self.warmup < self.warmup_samples:
++            self.warmup += 1
++            return
++        # A cycle emitting several tokens must contribute their full weight.
++        self.elapsed[depth] = .75 * self.elapsed.get(depth, seconds) + .25 * seconds
++        self.emitted[depth] = .75 * self.emitted.get(depth, emitted) + .25 * emitted
++        self.costs[depth] = self.elapsed[depth] / self.emitted[depth]
++        self.samples[depth] = self.samples.get(depth, 0) + 1
++        if depth != self.depth or self.samples[depth] < self.min_samples:
++            return
++        if depth == 0:
++            if self.probing:
++                self.depth = 1
++            else:
++                self._choose()
++            return
++        if self.probing:
++            if depth == 1 and self.costs[1] >= self.costs[0] * .97:
++                self.depth, self.stopped = 0, True
++            elif depth < self.max_depth:
++                self.depth += 1
++            else:
++                self.probing = False
++                self._choose()
++        else:
++            self.updates += 1
++            self.baseline_age += 1
++            if self.updates >= 16:
++                self.updates = 0
++                self._choose()
++            if not self.stopped and self.baseline_age >= 32:
++                self.depth, self.baseline_age = 0, 0
++                self.samples[0] = 0
++
++    def _choose(self):
++        best = min(self.costs, key=self.costs.get)
++        if self.costs[best] >= self.costs[0] * .97:
++            self.depth, self.stopped = 0, True
++        elif (self.depth == 0 or self.costs[self.depth] >= self.costs[0] * .97
++              or self.costs[best] < self.costs[self.depth] * .9):
++            self.depth = best
++            self.stopped = best == 0
+--- a/python/freetoken/scheduler/scheduler.py
++++ b/python/freetoken/scheduler/scheduler.py
+@@ -886,6 +886,9 @@
+             if not hasattr(self, "_mtp_runner"):
+                 self._mtp_runner = MTPRunner(self)
+             return self._mtp_runner.forward(forward_input)
++        return self._forward_standard(forward_input)
++
++    def _forward_standard(self, forward_input: ForwardInput) -> ForwardOutput:
+         batch, sample_args, input_mapping, output_mapping = forward_input
+         batch.input_ids = self.token_pool[input_mapping]
+         if self.toolcall_anchor_id is not None and not batch.is_prefill:
+--- a/python/freetoken/server/args.py
++++ b/python/freetoken/server/args.py
+@@ -322,6 +322,8 @@
+         default=ServerArgs.mtp_speculative_tokens,
+         help="Number of speculative draft tokens with the checkpoint MTP head (0 disables; 1-4).",
+     )
++    parser.add_argument("--mtp-auto", action="store_true", default=ServerArgs.mtp_auto,
++                        help="Select depth 0-3 per request from measured time per emitted token; requires MTP.")
+ 
+     parser.add_argument(
+         "--num-tokenizer",

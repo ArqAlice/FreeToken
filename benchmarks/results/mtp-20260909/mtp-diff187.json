@@ -1,0 +1,1894 @@
+{
+  "model": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+  "tokens": 48,
+  "runs": [
+    {
+      "repeat": 0,
+      "mtp": 0,
+      "prompt": "hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello Complete: one two three",
+      "seconds": 5.628573100999347,
+      "proposed": 0,
+      "accepted": 0,
+      "text": " four five six seven eight nine ten\n\n<think>\nThe user is asking me to complete a sequence. They've written \"hello\" many times, then said \"Complete: one two three four five six seven eight nine ten\"\n\nThis is",
+      "token_ids": [
+        2943,
+        4097,
+        4590,
+        7840,
+        7810,
+        11292,
+        5600,
+        271,
+        248068,
+        198,
+        760,
+        1156,
+        369,
+        9859,
+        728,
+        310,
+        4434,
+        264,
+        8240,
+        13,
+        2302,
+        2908,
+        5158,
+        328,
+        14556,
+        1,
+        1599,
+        2942,
+        11,
+        1179,
+        1018,
+        328,
+        12188,
+        25,
+        799,
+        1330,
+        2250,
+        2943,
+        4097,
+        4590,
+        7840,
+        7810,
+        11292,
+        5600,
+        1,
+        271,
+        1919,
+        369
+      ]
+    },
+    {
+      "repeat": 0,
+      "mtp": 1,
+      "prompt": "hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello Complete: one two three",
+      "seconds": 8.777646362999803,
+      "proposed": 25,
+      "accepted": 21,
+      "text": " four five six seven eight nine ten\n\n<think>\nThe user is asking me to complete a sequence. They've written \"hello\" many times, then said \"Complete: one two three four five six seven eight nine ten\"\n\nThis is",
+      "token_ids": [
+        2943,
+        4097,
+        4590,
+        7840,
+        7810,
+        11292,
+        5600,
+        271,
+        248068,
+        198,
+        760,
+        1156,
+        369,
+        9859,
+        728,
+        310,
+        4434,
+        264,
+        8240,
+        13,
+        2302,
+        2908,
+        5158,
+        328,
+        14556,
+        1,
+        1599,
+        2942,
+        11,
+        1179,
+        1018,
+        328,
+        12188,
+        25,
+        799,
+        1330,
+        2250,
+        2943,
+        4097,
+        4590,
+        7840,
+        7810,
+        11292,
+        5600,
+        1,
+        271,
+        1919,
+        369
+      ]
+    }
+  ],
+  "diagnostic": {
+    "position": 187,
+    "input_ids": [
+      11292,
+      5600
+    ],
+    "layers": [
+      {
+        "layer": 0,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 1,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.000732421875,
+            0.000244140625
+          ],
+          "rms": [
+            3.3694261219352484e-05,
+            1.535046612843871e-05
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 2,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0009765625,
+            0.00048828125
+          ],
+          "rms": [
+            6.827900506323203e-05,
+            4.2115949327126145e-05
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 3,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0009765625,
+            0.00146484375
+          ],
+          "rms": [
+            8.119432459352538e-05,
+            8.97442878340371e-05
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 4,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0009765625,
+            0.001953125
+          ],
+          "rms": [
+            9.11838942556642e-05,
+            0.00010635600483510643
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 5,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0009765625,
+            0.001953125
+          ],
+          "rms": [
+            0.00010787106293719262,
+            0.00013262151333037764
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 6,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0009765625,
+            0.001953125
+          ],
+          "rms": [
+            0.0001310807274421677,
+            0.00016440504987258464
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 7,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.001220703125,
+            0.00201416015625
+          ],
+          "rms": [
+            0.00016776709526311606,
+            0.00022467717644758523
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 8,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.001708984375,
+            0.001983642578125
+          ],
+          "rms": [
+            0.00017977798415813595,
+            0.00023899556254036725
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 9,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.001708984375,
+            0.00201416015625
+          ],
+          "rms": [
+            0.00018633398576639593,
+            0.0002431155735393986
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 10,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.001953125,
+            0.001953125
+          ],
+          "rms": [
+            0.00019564588728826493,
+            0.00025732096401043236
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 11,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.001953125,
+            0.001953125
+          ],
+          "rms": [
+            0.00021010827913414687,
+            0.0002713652211241424
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 12,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.001953125,
+            0.00201416015625
+          ],
+          "rms": [
+            0.00023127938038669527,
+            0.00030342949321493506
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 13,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.001953125,
+            0.002044677734375
+          ],
+          "rms": [
+            0.00024527538334950805,
+            0.00032758558518253267
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 14,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.001953125,
+            0.00244140625
+          ],
+          "rms": [
+            0.0002629222581163049,
+            0.00036413181805983186
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 15,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.002685546875,
+            0.00341796875
+          ],
+          "rms": [
+            0.0003477477002888918,
+            0.0004903195076622069
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 16,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.002685546875,
+            0.0103607177734375
+          ],
+          "rms": [
+            0.00036456933594308794,
+            0.001532378257252276
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 17,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0029296875,
+            0.00799560546875
+          ],
+          "rms": [
+            0.00037893583066761494,
+            0.0014743278734385967
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 18,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.01080322265625,
+            0.01708984375
+          ],
+          "rms": [
+            0.001662708818912506,
+            0.0028759415727108717
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 19,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.010498046875,
+            0.017578125
+          ],
+          "rms": [
+            0.0016262995777651668,
+            0.002850743941962719
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 20,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.01025390625,
+            0.01495361328125
+          ],
+          "rms": [
+            0.0015830069314688444,
+            0.0031005057971924543
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 21,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.01123046875,
+            0.01611328125
+          ],
+          "rms": [
+            0.0017894511111080647,
+            0.0030993588734418154
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 22,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.01220703125,
+            0.0255126953125
+          ],
+          "rms": [
+            0.0019061785424128175,
+            0.004299282096326351
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 23,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.01220703125,
+            0.02197265625
+          ],
+          "rms": [
+            0.0019307793118059635,
+            0.004201521631330252
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 24,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.01171875,
+            0.0224609375
+          ],
+          "rms": [
+            0.0019271416822448373,
+            0.004312275443226099
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 25,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0107421875,
+            0.0224609375
+          ],
+          "rms": [
+            0.0018853042274713516,
+            0.004179876763373613
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 26,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0107421875,
+            0.0283203125
+          ],
+          "rms": [
+            0.0018739430233836174,
+            0.005663495045155287
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 27,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0107421875,
+            0.02587890625
+          ],
+          "rms": [
+            0.0018807732267305255,
+            0.005749295931309462
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 28,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0107421875,
+            0.02978515625
+          ],
+          "rms": [
+            0.0019247119780629873,
+            0.0059330640360713005
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 29,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0107421875,
+            0.04085731506347656
+          ],
+          "rms": [
+            0.0019429713720455766,
+            0.007344611454755068
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 30,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0185546875,
+            0.057373046875
+          ],
+          "rms": [
+            0.003451996250078082,
+            0.008934106677770615
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 31,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.024169921875,
+            0.064453125
+          ],
+          "rms": [
+            0.004024177324026823,
+            0.008790978230535984
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 32,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0360107421875,
+            0.064453125
+          ],
+          "rms": [
+            0.005834083538502455,
+            0.009753097780048847
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 33,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.03515625,
+            0.06640625
+          ],
+          "rms": [
+            0.0059372540563344955,
+            0.011361471377313137
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 34,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.037384033203125,
+            0.06640625
+          ],
+          "rms": [
+            0.005905641242861748,
+            0.01144725363701582
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 35,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0361328125,
+            0.072265625
+          ],
+          "rms": [
+            0.0063499887473881245,
+            0.012366545386612415
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 36,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0546875,
+            0.1171875
+          ],
+          "rms": [
+            0.008245856501162052,
+            0.015453502535820007
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 37,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.06890869140625,
+            0.1171875
+          ],
+          "rms": [
+            0.012612883932888508,
+            0.016140930354595184
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 38,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0692138671875,
+            0.1181640625
+          ],
+          "rms": [
+            0.01295324694365263,
+            0.018876871094107628
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 39,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0673828125,
+            0.13427734375
+          ],
+          "rms": [
+            0.013408098369836807,
+            0.02050108090043068
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 40,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.072265625,
+            0.148681640625
+          ],
+          "rms": [
+            0.014035630971193314,
+            0.023561766371130943
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 41,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.078125,
+            0.13671875
+          ],
+          "rms": [
+            0.014498529955744743,
+            0.024288952350616455
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 42,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.08203125,
+            0.140625
+          ],
+          "rms": [
+            0.0154355363920331,
+            0.02479870244860649
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 43,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.0859375,
+            0.138671875
+          ],
+          "rms": [
+            0.015926847234368324,
+            0.025221675634384155
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 44,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.09765625,
+            0.1571197509765625
+          ],
+          "rms": [
+            0.017646795138716698,
+            0.02778778411448002
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 45,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.122314453125,
+            0.15625
+          ],
+          "rms": [
+            0.020424116402864456,
+            0.030819345265626907
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 46,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.15625,
+            0.171875
+          ],
+          "rms": [
+            0.022546891123056412,
+            0.03282191976904869
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      },
+      {
+        "layer": 47,
+        "prefill": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        },
+        "decode": {
+          "max_abs": [
+            0.1875,
+            0.21875
+          ],
+          "rms": [
+            0.024035943672060966,
+            0.03354237601161003
+          ]
+        },
+        "row_linear": {
+          "max_abs": [
+            0.0,
+            0.0
+          ],
+          "rms": [
+            0.0,
+            0.0
+          ]
+        }
+      }
+    ],
+    "logits": {
+      "joint": {
+        "top_ids": [
+          [
+            5600,
+            1,
+            42744,
+            11292,
+            53797
+          ],
+          [
+            1,
+            3158,
+            1149,
+            471,
+            50799
+          ]
+        ],
+        "top_values": [
+          [
+            26.625,
+            16.875,
+            15.125,
+            15.125,
+            15.0
+          ],
+          [
+            23.25,
+            21.625,
+            17.875,
+            13.375,
+            13.3125
+          ]
+        ],
+        "max_abs_vs_decode": [
+          0.390625,
+          0.375
+        ],
+        "max_abs_vs_joint": [
+          0.0,
+          0.0
+        ]
+      },
+      "prefill": {
+        "top_ids": [
+          [
+            5600,
+            1,
+            42744,
+            11292,
+            53797
+          ],
+          [
+            1,
+            3158,
+            1149,
+            471,
+            50799
+          ]
+        ],
+        "top_values": [
+          [
+            26.625,
+            16.875,
+            15.125,
+            15.125,
+            15.0
+          ],
+          [
+            23.25,
+            21.625,
+            17.875,
+            13.375,
+            13.3125
+          ]
+        ],
+        "max_abs_vs_decode": [
+          0.390625,
+          0.375
+        ],
+        "max_abs_vs_joint": [
+          0.0,
+          0.0
+        ]
+      },
+      "decode": {
+        "top_ids": [
+          [
+            5600,
+            1,
+            42744,
+            11292,
+            53797
+          ],
+          [
+            1,
+            3158,
+            1149,
+            471,
+            50799
+          ]
+        ],
+        "top_values": [
+          [
+            26.625,
+            16.875,
+            15.25,
+            15.1875,
+            14.9375
+          ],
+          [
+            23.125,
+            21.75,
+            17.875,
+            13.375,
+            13.3125
+          ]
+        ],
+        "max_abs_vs_decode": [
+          0.0,
+          0.0
+        ],
+        "max_abs_vs_joint": [
+          0.390625,
+          0.375
+        ]
+      },
+      "row_linear": {
+        "top_ids": [
+          [
+            5600,
+            1,
+            42744,
+            11292,
+            53797
+          ],
+          [
+            1,
+            3158,
+            1149,
+            471,
+            50799
+          ]
+        ],
+        "top_values": [
+          [
+            26.625,
+            16.875,
+            15.125,
+            15.125,
+            15.0
+          ],
+          [
+            23.25,
+            21.625,
+            17.875,
+            13.375,
+            13.3125
+          ]
+        ],
+        "max_abs_vs_decode": [
+          0.390625,
+          0.375
+        ],
+        "max_abs_vs_joint": [
+          0.0,
+          0.0
+        ]
+      }
+    }
+  },
+  "parity": [
+    {
+      "repeat": 0,
+      "prompt": "hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello Complete: one two three",
+      "equal": true
+    }
+  ]
+}

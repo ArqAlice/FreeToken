@@ -29,6 +29,55 @@ def _config(num_layers: int = 4) -> ModelConfig:
     return parse_config(toy_hf_config(num_layers))
 
 
+def test_target_residual_without_output_skips_final_mixer():
+    from freetoken.models.qwen4_exp.model import Qwen4ExpModel
+
+    model = SimpleNamespace(embed_tokens=SimpleNamespace(forward=lambda ids: ids.float().unsqueeze(1)),
+        hc_count=2, _ple=(), layers=SimpleNamespace(op_list=[]))
+    output, residual = Qwen4ExpModel.forward(model, torch.tensor([1, 2]), None,
+                                           return_residual=True, compute_output=False)
+    assert output is None
+    torch.testing.assert_close(residual, torch.tensor([[1., 1.], [2., 2.]]))
+
+
+def test_residual_only_forwards_skip_lm_head(monkeypatch):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    calls = []
+    residual = torch.ones(2, 4)
+
+    def forward(*a, **kw):
+        calls.append(kw)
+        return None, residual
+
+    batch = SimpleNamespace(input_ids=torch.tensor([1, 2]))
+    monkeypatch.setattr("freetoken.models.qwen4_exp.model.get_global_ctx",
+                        lambda: SimpleNamespace(batch=batch))
+    model = SimpleNamespace(model=SimpleNamespace(forward=forward,
+        embed_tokens=SimpleNamespace(forward=lambda ids: ids)), mtp=SimpleNamespace(forward=forward))
+    assert Qwen4ExpForCausalLM.forward_with_target_residual(model, compute_logits=False)[0] is None
+    assert Qwen4ExpForCausalLM.forward_mtp(model, batch.input_ids, residual, batch,
+                                        compute_logits=False, return_residual=True)[0] is None
+    assert calls == [{"return_residual": True, "compute_output": False}] * 2
+
+
+@requires_cuda
+def test_mtp_hidden_norm_spans_all_residual_streams():
+    from freetoken.models.qwen4_exp.model import Qwen4ExpMTP
+
+    config = _config()
+    args = config.qwen4_args
+    with torch.device("cuda"):
+        head = Qwen4ExpMTP(config)
+        x = torch.arange(1, args.hc_count + 1, dtype=torch.float32)
+        x = x.repeat_interleave(args.hidden_size).unsqueeze(0).to(torch.bfloat16)
+        weight = torch.linspace(-0.2, 0.2, args.ple_state_width).to(torch.bfloat16)
+    head.pre_fc_norm_hidden.weight = weight
+    expected = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + config.rms_norm_eps)
+    expected = (expected * (1 + weight.float())).to(x.dtype)
+    torch.testing.assert_close(head.pre_fc_norm_hidden.forward(x), expected, rtol=1e-2, atol=1e-2)
+
+
 def _fill(op, gen: torch.Generator, scale: float = 0.05) -> None:
     """Random floats / zeroed ints for every state-dict tensor of an op tree."""
     for tensor in op.state_dict().values():
@@ -401,6 +450,41 @@ def test_shared_expert_gate_fusion_matches_eager():
     torch.testing.assert_close(fused, eager, rtol=2e-2, atol=2e-2)
     # The fused gate stays in fp32 where the eager chain rounds the scalar to bf16.
     assert (fused.float() - ref).abs().max() <= (eager.float() - ref).abs().max()
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_shared_expert_reads_finish_before_prefetched_routed_write(monkeypatch, overlap):
+    from contextlib import contextmanager
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.models.qwen4_exp.moe import Qwen4ExpMoE
+
+    calls = []
+    experts = OffloadMoELayer.__new__(OffloadMoELayer)
+
+    @contextmanager
+    def prefetch(hidden, logits):
+        calls.append("fetch")
+        yield (None, None)
+        calls.append("join")
+
+    def routed(hidden_states, *args, **kw):
+        calls.append("routed")
+        return hidden_states.fill_(99)
+
+    experts.prefetch_decode = prefetch
+    experts.forward_prefetched = routed
+    experts.forward = routed
+    model = SimpleNamespace(_mtp_expert_overlap=overlap, experts=experts,
+        gate=SimpleNamespace(forward=lambda x: x.clone()),
+        shared_expert=SimpleNamespace(forward=lambda x: x + 1),
+        shared_expert_gate=SimpleNamespace(weight=torch.ones(1, 4)))
+    monkeypatch.setattr("freetoken.models.qwen4_exp.moe.shared_gate_sigmoid", lambda x, w: x.sum(1))
+    monkeypatch.setattr("freetoken.models.qwen4_exp.moe.shared_gate_mul_add", lambda routed, shared, gate:
+                        routed + shared * gate[:, None])
+    x = torch.arange(8).reshape(2, 4).float()
+    expected = 99 + (x + 1) * x.sum(1, keepdim=True)
+    torch.testing.assert_close(Qwen4ExpMoE.forward(model, x), expected)
+    assert calls == (["fetch", "join", "routed"] if overlap else ["routed"])
 
 
 @requires_cuda

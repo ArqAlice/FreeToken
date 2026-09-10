@@ -1,0 +1,10 @@
+{
+  "before": {
+    "path": "/tmp/mtp-plan-before-python/freetoken/scheduler/mtp.py",
+    "sha256": "6fdbfff3fd431c655e2ac2fc254053d17e8d258716bf16db0c3f22eeab0d4730"
+  },
+  "after": {
+    "path": "/opt/freetoken/python/freetoken/scheduler/mtp.py",
+    "sha256": "1810e359b8299cc4cf83456d4860b22963564109d5061585b39329adaabcfa49"
+  }
+}

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
 from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add, shared_gate_sigmoid
-from freetoken.layers.moe import make_moe_layer
+from freetoken.layers.moe import OffloadMoELayer, make_moe_layer
 from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
 
 if TYPE_CHECKING:
@@ -19,6 +21,7 @@ class Qwen4ExpMoE(Qwen3_5MoE):
     """
 
     def __init__(self, config: ModelConfig, layer_id: int | None = None) -> None:
+        self._mtp_expert_overlap = os.environ.get("FREETOKEN_MTP_EXPERT_OVERLAP", "1") == "1"
         if getattr(config, "expert_quant", "none") != "fp8_block":
             super().__init__(config, layer_id=layer_id)
             return
@@ -37,9 +40,14 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate.forward(hidden_states)
-        shared = self.shared_expert.forward(hidden_states)
-        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        pending = (self.experts.prefetch_decode(hidden_states, router_logits)
+                   if self._mtp_expert_overlap and isinstance(self.experts, OffloadMoELayer)
+                   else nullcontext(None))
+        with pending as routing:
+            shared = self.shared_expert.forward(hidden_states)
+            gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
+        routed = (self.experts.forward_prefetched(hidden_states, routing) if routing is not None else
+                  self.experts.forward(hidden_states=hidden_states, router_logits=router_logits))
         return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
 
 

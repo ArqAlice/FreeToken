@@ -13,6 +13,20 @@ from freetoken.models.qwen4_exp.ple import GpuResidentTable, NGramEmbedding
 from .common import EOS, hash_constants, requires_cuda, toy_hf_config
 from .test_ple import _meta
 
+
+def test_compact_speculative_host_input_pads_fresh_context():
+    from freetoken.models.qwen4_exp.ple_disk import DiskRowTable
+
+    runs = []
+    table = object.__new__(DiskRowTable)
+    table.eos_token_id = 99
+    table.fill = lambda values, graph: runs.append((values[0].tolist(), graph))
+    for prefix in ([], [4], [3, 4]):
+        batch = SimpleNamespace(ple_prefix_ids=torch.tensor(prefix, dtype=torch.int32),
+            ple_input_ids=torch.tensor([5, 6], dtype=torch.int32))
+        table.host_fill_batch(batch, use_graph=True)
+    assert runs == [([99, 99, 5, 6], True), ([99, 4, 5, 6], True), ([3, 4, 5, 6], True)]
+
 _ple_store = pytest.importorskip("freetoken.kernel._ple_store")
 
 _KEY_PREFIX = "model.layers.1.ple.ple_embedding.ngram_embedding"
@@ -219,6 +233,17 @@ def test_layouts_readers_and_errors(tmp_path):
     )
     with pytest.raises(ValueError, match="dtype"):
         source_from_safetensors(str(tmp_path))
+
+    bf16 = torch.arange(32, dtype=torch.bfloat16).view(8, 4)
+    save_file(
+        {f"{_KEY_PREFIX}.shard_0.weight": bf16}, str(tmp_path / "model.safetensors")
+    )
+    source = source_from_safetensors(str(tmp_path))
+    assert source.dtype is torch.bfloat16
+    assert source.row_bytes == 8
+    assert source.row_stride == 8
+    assert source.scale == 1.0
+
     save_file(
         {f"{_KEY_PREFIX}.shard_1.weight": torch.zeros(8, 4, dtype=torch.float8_e4m3fn),
          f"{_KEY_PREFIX}.weight_scale": torch.tensor(1.0, dtype=torch.bfloat16)},
@@ -309,6 +334,13 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
     ids = emb.row_ids(_meta([[7]], [[3, 4]], decode=True)).cuda()
     assert _bitwise_equal(out, oracle.lookup(ids)), "capture+replay"
 
+    req = SimpleNamespace(input_ids=torch.tensor([3, 4, 9]), cached_len=2, device_len=3)
+    with disk.forward_host_ctx(SimpleNamespace(is_decode=False, padded_reqs=[req]), use_graph=True):
+        graph.replay()
+    torch.cuda.synchronize()
+    ids = emb.row_ids(_meta([[9]], [[3, 4]], decode=True)).cuda()
+    assert _bitwise_equal(out, oracle.lookup(ids)), "continuation prefill graph staging"
+
     if disk._wait_sync:
         # launch first, fill after: an early WAIT pass would surface the previous step's bytes
         older, newer = 3, 4
@@ -327,8 +359,44 @@ def test_graph_sync_protocol(tmp_path, monkeypatch):
         ids = emb.row_ids(_meta([[7]], [[3, 4]], decode=True)).cuda()
         assert _bitwise_equal(out, oracle.lookup(ids)), "forward_host_ctx deferred"
 
+        # MTP verification carries GPU draft ids absent from the host request history.
+        for token in (17, 19):
+            batch = SimpleNamespace(ple_prefix_ids=torch.tensor([3, 4]),
+                                    ple_input_ids=torch.tensor([token], dtype=torch.int32, device="cuda"))
+            with disk.forward_host_ctx(batch, use_graph=True):
+                graph.replay()
+            torch.cuda.synchronize()
+            ids = emb.row_ids(_meta([[token]], [[3, 4]], decode=True)).cuda()
+            assert _bitwise_equal(out, oracle.lookup(ids)), "MTP deferred draft ids"
+
     # gate mode: the hook fills inline and returns no deferred
     monkeypatch.setenv("FREETOKEN_PLE_SYNC", "gate")
     gated, _, _ = _make_table(tmp_path)
     assert not gated._wait_sync
     assert gated.host_fill_batch(_decode_batch([3, 4], 5), use_graph=True) is None
+
+
+@requires_cuda
+@pytest.mark.parametrize("count", [2, 4, 5])
+@pytest.mark.parametrize("prefix", [[], [3], [3, 4]])
+def test_mtp_disk_ple_readback_matches_eager(tmp_path, count, prefix):
+    disk, oracle, args = _make_table(tmp_path)
+    emb = _embedding()
+    tokens = list(range(7, 7 + count))
+    context = [EOS] * (2 - len(prefix)) + prefix
+    batch = SimpleNamespace(ple_prefix_ids=torch.tensor(prefix, dtype=torch.int32),
+                            ple_input_ids=torch.tensor(tokens, dtype=torch.int32, device="cuda"))
+    ids = emb.row_ids(_meta([tokens], [context])).cuda()
+    disk.host_fill_batch(batch, use_graph=False)
+    assert _bitwise_equal(disk.lookup(ids), oracle.lookup(ids))
+    out = torch.empty((count, args.num_ngram_heads * disk.head_dim), dtype=disk.dtype, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        disk.lookup(ids, out)
+    torch.cuda.current_stream().wait_stream(stream)
+    with disk.forward_host_ctx(batch, use_graph=True):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert _bitwise_equal(out, oracle.lookup(ids))

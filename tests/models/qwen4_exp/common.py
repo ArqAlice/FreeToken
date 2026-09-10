@@ -232,6 +232,7 @@ class Fixture:
             padded_size=len(reqs),
             is_prefill=phase == "prefill",
             is_decode=phase == "decode",
+            use_decode_moe=False,
             positions=positions,
             out_loc=out_loc,
             attn_metadata=None,
@@ -250,8 +251,8 @@ def selection_spy(monkeypatch, backend) -> dict:
     seen: dict[str, torch.Tensor] = {}
     original = QSASparseAttnBackend._select
 
-    def spy(self, index, md, slot):
-        indices = original(self, index, md, slot)
+    def spy(self, index, md, slot, **kwargs):
+        indices = original(self, index, md, slot, **kwargs)
         seen["indices"] = indices.clone()
         return indices
 

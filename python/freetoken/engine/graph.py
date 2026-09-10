@@ -105,6 +105,7 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
+        capture_target_residual: bool = False,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -118,6 +119,8 @@ class GraphRunner:
         self.moe_offload_cache = moe_offload_cache
         self.stream = stream
         self.device = device
+        self.capture_target_residual = capture_target_residual
+        self.target_residuals = {}
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -176,7 +179,12 @@ class GraphRunner:
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self.buffer.logits[:bs] = model.forward()
+                    if self.capture_target_residual:
+                        logits, residual = model.forward_with_target_residual()
+                        self.target_residuals[bs] = residual
+                        self.buffer.logits[:bs] = logits
+                    else:
+                        self.buffer.logits[:bs] = model.forward()
                 self._reset_moe_offload_cache()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
@@ -213,5 +221,6 @@ class GraphRunner:
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
+        self.target_residuals = {}
         self.buffer = None
         gc.collect()

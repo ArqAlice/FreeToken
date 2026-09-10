@@ -88,6 +88,51 @@ def materialize_layer(cache, layer_id: int) -> None:
 
 def reset_cache(cache) -> None:
     _reset_cache_gpu(cache)
+    if cache.lrfu_frequency is not None:
+        cache.lrfu_frequency.zero_()
+        cache.lrfu_last.zero_()
+
+
+def prepare_lrfu(cache, layer_id, expert_ids):
+    _prepare_lrfu_kernel[(1,)](
+        expert_ids, cache.id_of_slot, cache.usage, cache.step,
+        cache.lrfu_frequency, cache.lrfu_last, expert_ids.numel(), cache.cache_size,
+        layer_id * cache.num_experts, cache.lrfu_half_life,
+        cache.layer_distance_penalty, cache.num_experts, cache.num_layers,
+        BK=triton.next_power_of_2(expert_ids.numel()),
+        BC=triton.next_power_of_2(cache.cache_size), num_warps=8)
+
+
+@triton.jit
+def _prepare_lrfu_kernel(query, owners, usage, clock, frequency, last,
+                         K: tl.constexpr, C: tl.constexpr, base, half_life,
+                         distance_penalty: tl.constexpr, E: tl.constexpr, L: tl.constexpr,
+                         BK: tl.constexpr, BC: tl.constexpr):
+    k = tl.arange(0, BK)
+    q = tl.load(query + k, k < K, other=0) + base
+    same = (q[:, None] == q[None, :]) & (k[:, None] > k[None, :]) & (k[None, :] < K)
+    first = (k < K) & (tl.sum(same.to(tl.int32), 1) == 0)
+    step = tl.load(clock) + 1
+    previous = tl.load(last + q, first, other=0)
+    old = tl.load(frequency + q, first, other=0)
+    value = old * tl.exp2(-(step - previous).to(tl.float32) / half_life) + 1.
+    tl.store(frequency + q, value, first)
+    tl.store(last + q, step, first)
+    tl.debug_barrier()
+    c = tl.arange(0, BC)
+    owner = tl.load(owners + c, c < C, other=-1)
+    valid = (c < C) & (owner >= 0)
+    f = tl.load(frequency + owner, valid, other=0)
+    t = tl.load(last + owner, valid, other=0)
+    # Log scores preserve decayed-frequency order without rescanning the whole ID space.
+    score = t * 256 + (half_life * 256 * tl.log2(tl.maximum(f, 1.e-30))).to(tl.int64)
+    if distance_penalty > 0:
+        # Equal-frequency experts in upcoming layers have less time to wait for reuse.
+        distance = (tl.maximum(owner, 0) // E - base // E - 1 + L) % L
+        score -= (distance * (256 * distance_penalty)).to(tl.int64)
+    # LRU protects current hits with a positive clock value; policy ranks stay negative.
+    score = tl.where(valid, score - (1 << 60), -(1 << 62))
+    tl.store(usage + c, score, c < C)
 
 
 

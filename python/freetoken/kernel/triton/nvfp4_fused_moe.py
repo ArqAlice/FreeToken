@@ -45,6 +45,13 @@ def _e2m1_lut(device_index: int) -> torch.Tensor:
 
 
 @triton.jit
+def _e2m1_arithmetic(code):
+    """Construct the exact FP32 value, including signed zero, without a LUT gather."""
+    bits = ((code << 9) & 0x0E00) | ((code & 8) << 12)
+    return bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32) * 16384.0
+
+
+@triton.jit
 def _decode_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 2] uint8
@@ -156,6 +163,7 @@ def _decode_nvfp4_marlin_kernel(
     A_ROW_IS_ROUTE: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
+    ARITHMETIC_DEQUANT: tl.constexpr = False,
 ):
     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
 
@@ -210,7 +218,10 @@ def _decode_nvfp4_marlin_kernel(
         acc_w = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
         for j in tl.static_range(8):
             code = (word >> (4 * j)) & 0xF
-            b = tl.load(lut_ptr + code)
+            if ARITHMETIC_DEQUANT:
+                b = _e2m1_arithmetic(code)
+            else:
+                b = tl.load(lut_ptr + code)
             a_j = tl.load(a_base + (kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
             acc_w += a_j[:, None] * b
         partial += acc_w * scale

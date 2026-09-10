@@ -101,6 +101,32 @@ def test_kv_quant_spellings():
         _resolve_kv_quant("q8")
 
 
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 4, -1, 5])
+def test_mtp_speculation_limit(count):
+    from freetoken.engine.engine import _validate_attention_backend_choice
+
+    config = SimpleNamespace(attention_backend="triton", mtp_speculative_tokens=count,
+        model_config=SimpleNamespace(qwen4_args=SimpleNamespace(mtp_num_hidden_layers=1)))
+    if 0 <= count <= 4:
+        _validate_attention_backend_choice(config, None, frozenset())
+    else:
+        with pytest.raises(ValueError, match="mtp-speculative-tokens"):
+            _validate_attention_backend_choice(config, None, frozenset())
+
+
+@pytest.mark.parametrize("depth,tp,error", [(0, 1, True), (3, 2, True), (3, 1, False)])
+def test_auto_requires_mtp_and_single_rank(depth, tp, error):
+    from freetoken.engine.engine import _validate_attention_backend_choice
+    config = SimpleNamespace(attention_backend="triton", mtp_speculative_tokens=depth,
+        mtp_auto=True, tp_info=SimpleNamespace(size=tp),
+        model_config=SimpleNamespace(qwen4_args=SimpleNamespace(mtp_num_hidden_layers=1)))
+    if error:
+        with pytest.raises(ValueError, match="mtp-auto"):
+            _validate_attention_backend_choice(config, None, frozenset())
+    else:
+        _validate_attention_backend_choice(config, None, frozenset())
+
+
 def test_only_the_backends_that_read_scales_declare_fp8_support():
     from freetoken.attention import SUPPORTED_ATTENTION_BACKENDS, attention_backend_info
 

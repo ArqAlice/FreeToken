@@ -20,7 +20,7 @@ from freetoken.utils import init_logger
 from .weight import (
     _PLE_SCALE_SUFFIX,
     _PLE_SHARD_RE,
-    _PLE_ST_DTYPE,
+    _PLE_ST_DTYPES,
     _ple_table_files,
     _safetensors_header,
 )
@@ -48,6 +48,7 @@ class PleRowSource:
     row_bytes: int
     row_stride: int
     scale: float
+    dtype: torch.dtype
 
     @property
     def total_rows(self) -> int:
@@ -55,9 +56,10 @@ class PleRowSource:
 
 
 def source_from_safetensors(folder: str) -> PleRowSource:
-    """Map the checkpoint's ``ngram_embedding.shard_<i>`` tensors in place: one extent per shard, no copy."""
+    """Map FP8 or BF16 ``ngram_embedding.shard_<i>`` tensors in place."""
     rows = cols = 0
     scale: torch.Tensor | None = None
+    table_dtype: torch.dtype | None = None
     paths: list[str] = []
     path_idx: dict[str, int] = {}
     shards: dict[int, tuple[int, int]] = {}
@@ -73,8 +75,12 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             match = _PLE_SHARD_RE.search(key)
             if match is None:
                 continue
-            if meta["dtype"] != _PLE_ST_DTYPE:
-                raise ValueError(f"PLE shard {key} has dtype {meta['dtype']}, expected {_PLE_ST_DTYPE}")
+            dtype = _PLE_ST_DTYPES.get(meta["dtype"])
+            if dtype is None:
+                raise ValueError(f"PLE shard {key} has unsupported dtype {meta['dtype']}")
+            if table_dtype is not None and dtype is not table_dtype:
+                raise ValueError(f"PLE shard {key} has mixed dtype {meta['dtype']}")
+            table_dtype = dtype
             if rows and tuple(meta["shape"]) != (rows, cols):
                 raise ValueError(f"PLE shard {key} is {meta['shape']}, expected {[rows, cols]}")
             rows, cols = meta["shape"]
@@ -87,10 +93,18 @@ def source_from_safetensors(folder: str) -> PleRowSource:
             shards[idx] = (path_idx[path], base + meta["data_offsets"][0])
     if sorted(shards) != list(range(len(shards))) or not shards:
         raise ValueError(f"PLE shard indices are not contiguous 0..N-1: {sorted(shards)[:8]}")
+    if table_dtype is None:
+        raise ValueError("PLE table has no shards")
     if scale is None:
-        raise ValueError("PLE table has no weight_scale")
+        if table_dtype is not torch.bfloat16:
+            raise ValueError("FP8 PLE table has no weight_scale")
+        scale = torch.ones((), dtype=torch.bfloat16)
     order = [shards[i] for i in range(len(shards))]
-    return PleRowSource(paths, [f for f, _ in order], [b for _, b in order], rows, cols, cols, float(scale))
+    row_bytes = cols * table_dtype.itemsize
+    return PleRowSource(
+        paths, [f for f, _ in order], [b for _, b in order], rows, row_bytes, row_bytes,
+        float(scale), table_dtype,
+    )
 
 
 def resolve_row_source(folder: str) -> PleRowSource:
@@ -113,7 +127,8 @@ class DiskRowTable:
         from freetoken.kernel import _ple_store
 
         self.num_rows = source.total_rows
-        self.head_dim = source.row_bytes  # fp8: one byte per element
+        self.head_dim = source.row_bytes // source.dtype.itemsize
+        self._table_dtype = source.dtype
         self.dtype = dtype
         self.heads = int(hash_constants["num_ngram_heads"])
         self.scale = source.scale
@@ -139,7 +154,9 @@ class DiskRowTable:
             use_io_uring=os.getenv(_IO_URING_ENV, "1") != "0",
         )
         self._device = torch.device("cuda", torch.cuda.current_device())
-        self._token_bytes = self.heads * self.head_dim
+        # One hash-table row is read for each n-gram head. ``head_dim`` is an
+        # element count, while the staging stores raw checkpoint bytes.
+        self._token_bytes = self.heads * source.row_bytes
         # allocated up front: pinned alloc inside stream capture is illegal; one replay consumes it at a time
         self._graph_pinned = alloc_pinned_tensor(max_graph_rows * self._token_bytes, dtype=torch.uint8)
         self._graph_pinned.zero_()  # padded decode lanes read whatever sits here
@@ -194,28 +211,23 @@ class DiskRowTable:
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows; returns the post-dispatch fill callable under flag-sync, else None."""
         eos = self.eos_token_id
+        if getattr(batch, "ple_input_ids", None) is not None:
+            prefix = batch.ple_prefix_ids.to(torch.int64)
+            padding = prefix.new_full((2 - prefix.numel(),), eos)
+            def fill_tokens(tokens):
+                self.fill([torch.cat((padding, prefix, tokens))], graph=use_graph)
+            if use_graph and batch.ple_input_ids.is_cuda and self._wait_sync:
+                return self._defer_tokens(batch.ple_input_ids, fill_tokens)
+            fill_tokens(batch.ple_input_ids.to(device="cpu", dtype=torch.int64))
+            return None
         if batch.is_decode:
             reqs = list(batch.reqs)
             if use_graph and self._wait_sync:
-                bs = batch.padded_size
-                self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
-                self._readback_event.record(torch.cuda.current_stream(self._device))
-
-                def _complete() -> None:
-                    try:
-                        self._readback_event.synchronize()
-                        tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
-                        self.fill(runs, graph=True)
-                    except BaseException:
-                        from freetoken.kernel import _ple_store
-
-                        # unblock the stream before surfacing; the step's output is discarded
-                        _ple_store.signal_flag(self._flag.data_ptr())
-                        raise
-
-                return _complete
+                def fill_tokens(tokens):
+                    runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
+                            for r, t in zip(reqs, tokens.tolist())]
+                    self.fill(runs, graph=True)
+                return self._defer_tokens(batch.input_ids, fill_tokens)
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
             runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
@@ -229,8 +241,25 @@ class DiskRowTable:
             ))
             for req in batch.padded_reqs
         ]
-        self.fill(runs, graph=False)
+        self.fill(runs, graph=use_graph)
         return None
+
+    def _defer_tokens(self, ids, consume):
+        count = ids.numel()
+        self._token_readback[:count].copy_(ids, non_blocking=True)
+        self._readback_event.record(torch.cuda.current_stream(self._device))
+
+        def complete():
+            try:
+                self._readback_event.synchronize()
+                consume(self._token_readback[:count].to(torch.int64))
+            except BaseException:
+                from freetoken.kernel import _ple_store
+
+                # Unblock a dispatched graph before propagating a disk/readback failure.
+                _ple_store.signal_flag(self._flag.data_ptr())
+                raise
+        return complete
 
     @contextmanager
     def forward_host_ctx(self, batch: Batch, use_graph: bool):
@@ -257,7 +286,7 @@ class DiskRowTable:
         )
         nbytes = rows * self._token_bytes
         dev[:nbytes].copy_(pinned[:nbytes], non_blocking=True)
-        values = dev[:nbytes].view(torch.float8_e4m3fn).to(self.dtype)
+        values = dev[:nbytes].view(self._table_dtype).to(self.dtype)
         if self.scale != 1.0:
             values = values * self.scale
         values = values.view(*row_ids.shape[:-1], -1)

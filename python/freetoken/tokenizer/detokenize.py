@@ -91,6 +91,10 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        # Speculative decoding can deliver consecutive tokens for one request in
+        # a batch; commit each offset before decoding its successor.
+        if len({msg.uid for msg in msgs}) != len(msgs):
+            return [self.detokenize([msg])[0] for msg in msgs]
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

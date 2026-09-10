@@ -1,0 +1,28 @@
+[
+  {
+    "mode": 0,
+    "before": 41.157813087022454,
+    "after": 40.80567292214151,
+    "change": -0.8555852181368118,
+    "equal": 3,
+    "accepted_before": 0.0,
+    "proposed_before": 0.0,
+    "accepted_after": 0.0,
+    "proposed_after": 0.0,
+    "reused": 0.0,
+    "refreshed": 0.0
+  },
+  {
+    "mode": 3,
+    "before": 23.8559367149657,
+    "after": 25.278055695772967,
+    "change": 5.961279147404497,
+    "equal": 0,
+    "accepted_before": 406.0,
+    "proposed_before": 1070.0,
+    "accepted_after": 404.0,
+    "proposed_after": 1073.0,
+    "reused": 468.0,
+    "refreshed": 606.0
+  }
+]

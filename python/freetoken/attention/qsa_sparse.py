@@ -50,6 +50,7 @@ _CPU_PINNED = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 # Block-score transient budget (vLLM's number): the fp32 [rows, n_blocks] logits tile is
 # 256 KB per row at a 1M-token context, so a long prefill must be scored in row chunks.
 _LOGITS_WORKSPACE_BYTES = 128 << 20
+_MIN_ACTIVE_PAGES = 128
 
 
 TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
@@ -211,7 +212,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.token_to_req = token_to_req.to(self.device, non_blocking=True)
             md.seq_lens = kv_len.to(self.device, non_blocking=True)
             md.ring_slots = table_idx.to(self.device, non_blocking=True)
-            md.block_table = self._block_table(md.ring_slots.to(torch.int64))
+            md.block_table = self._block_table(
+                md.ring_slots.to(torch.int64), max(seqlens_k, default=1)
+            )
         # Decode addressing is DEFERRED: a graph-bound step stages it into the static
         # buffers (prepare_for_replay), an eager step snapshots at the first QSA layer.
 
@@ -220,10 +223,20 @@ class QSASparseAttnBackend(BaseAttnBackend):
         VIEW, so gathering rows through it materializes only [bs, W/page_size]."""
         return get_global_ctx().page_table[:, :: self.page_size]
 
-    def _block_table(self, table_idx: torch.Tensor) -> torch.Tensor:
-        return (self._block_base_view().index_select(0, table_idx) // self.page_size).to(
-            torch.int32
-        )
+    def _block_table(
+        self, table_idx: torch.Tensor, max_seq_len: int | None = None
+    ) -> torch.Tensor:
+        pages = self._block_base_view()
+        # torch.topk's tie order depends on padded width; preserve its fallback layout.
+        if max_seq_len is not None and self._block_topk_kernel is not None:
+            needed = max(1, -(-max_seq_len // self.page_size))
+            # Buckets bound speculative graph variants while excluding the unused
+            # context capacity from scoring and top-k launches.
+            width = min(
+                pages.shape[1], max(_MIN_ACTIVE_PAGES, 1 << (needed - 1).bit_length())
+            )
+            pages = pages[:, :width]
+        return (pages.index_select(0, table_idx) // self.page_size).to(torch.int32)
 
     def _stage_decode(self, md: QSASparseMetadata, bs: int, table_idx: torch.Tensor) -> None:
         """Copy this step's addressing into the static graph buffers and point the metadata
@@ -246,7 +259,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         bs = len(reqs)
         table_idx = torch.tensor([r.table_idx for r in reqs], **_CPU_PINNED)
         md.ring_slots = table_idx.to(self.device, non_blocking=True)
-        md.block_table = self._block_table(md.ring_slots.to(torch.int64))
+        md.block_table = self._block_table(
+            md.ring_slots.to(torch.int64), max((r.device_len for r in reqs), default=1)
+        )
         md.seq_lens = md.kv_len_cpu.to(self.device, non_blocking=True)
         md.token_to_req = torch.arange(bs, dtype=torch.int32, device=self.device)
         md.cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=self.device)
@@ -291,7 +306,17 @@ class QSASparseAttnBackend(BaseAttnBackend):
             self._plan_index_writes(md, batch)
 
         self._update_index_cache(index, md, slot)
-        indices = self._select(index, md, slot)
+        saved_blocks = getattr(batch, "mtp_qsa_blocks", {}).get(layer_id)
+        if saved_blocks is None:
+            indices = self._select(index, md, slot)
+        elif getattr(batch, "mtp_qsa_reuse", False):
+            from freetoken.kernel.triton.qsa import expand_qsa_block_indices
+
+            indices = self._scratch("indices", 1, self.select_width, dtype=torch.int32)
+            expand_qsa_block_indices(saved_blocks, md.positions, md.seq_lens, md.token_to_req,
+                                     self.ratio, self.token_topk, indices)
+        else:
+            indices = self._select(index, md, slot, save_blocks=saved_blocks)
         # K/V scale tensors are independent of the BF16 index tier, so selection is
         # quantization-agnostic; only sparse K/V attention reconstructs the codes.
         return qsa_sparse_paged_attention(
@@ -307,6 +332,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             kv_quant=self.kvcache.kv_quant,
             k_block_scale=self.kvcache.k_block_scale(layer_id),
             v_block_scale=self.kvcache.v_block_scale(layer_id),
+            decode_profile=batch.use_decode_moe,
         )
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
@@ -368,7 +394,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # ones a straddling group just consumed.
         qsa_store_rows(ring, md.ring_rows, index.k)
 
-    def _select(self, index, md: QSASparseMetadata, slot: int) -> torch.Tensor:
+    def _select(self, index, md: QSASparseMetadata, slot: int, *, save_blocks=None) -> torch.Tensor:
         """Score complete visible blocks, take the top-k, expand them to token indices."""
         from freetoken.kernel.triton.qsa import (
             expand_qsa_block_indices,
@@ -412,6 +438,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             )
             blocks = self._scratch("blocks", end - start, self.block_topk, dtype=torch.int32)
             self._top_blocks(logits, visible, blocks)
+            if save_blocks is not None and end == rows:
+                save_blocks.copy_(blocks[-1:])
             expand_qsa_block_indices(
                 blocks,
                 positions[chunk],
@@ -466,8 +494,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
         """A per-forward transient: the static decode buffer when it is wide enough (so a
         captured graph keeps one address), otherwise a fresh allocation."""
         buffer = self._graph.get(name)
-        if buffer is not None and rows <= buffer.shape[0] and buffer.shape[1:] == shape:
-            return buffer[:rows]
+        if buffer is not None and rows <= buffer.shape[0]:
+            if buffer.shape[1:] == shape:
+                return buffer[:rows]
+            if name in ("logits", "topk_scratch") and shape[0] <= buffer.shape[1]:
+                return buffer[:rows, :shape[0]]
         return torch.empty((rows, *shape), dtype=dtype, device=self.device)
 
     # ----- CUDA graph (decode) --------------------------------------------------------------

@@ -116,6 +116,34 @@ def test_qsa_nvfp4_requires_both_block_scale_tensors():
         )
 
 
+@pytest.mark.parametrize("kv_heads", [2, 8])
+def test_speculative_attention_preserves_decode_reduction(kv_heads):
+    torch.manual_seed(71)
+    rows, slots = 5, PAGE
+    k = torch.randn(slots, kv_heads * HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    codes = [torch.empty(slots, kv_heads, HEAD_DIM // 2, device="cuda", dtype=torch.uint8)
+             for _ in range(2)]
+    scales = [torch.empty(slots, kv_heads, device="cuda") for _ in range(2)]
+    blocks = [torch.empty(slots, kv_heads, HEAD_DIM // 16, device="cuda", dtype=torch.uint8)
+              for _ in range(2)]
+    quantize_nvfp4_to_cache(k, v, torch.arange(slots, device="cuda", dtype=torch.int32),
+                           *codes, *scales, *blocks)
+    q = torch.randn(rows, kv_heads * 8, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    columns = torch.arange(2048, device="cuda", dtype=torch.int32).expand(rows, -1)
+    indices = torch.where(columns < torch.arange(33, 38, device="cuda")[:, None], columns, -1)
+    table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+    mapping = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    args = dict(k_scale=scales[0], v_scale=scales[1], kv_quant="nvfp4",
+                k_block_scale=blocks[0], v_block_scale=blocks[1])
+    kc, vc = [code.view(1, PAGE, kv_heads, HEAD_DIM // 2) for code in codes]
+    expected = torch.cat([qsa_sparse_paged_attention(q[i:i + 1], kc, vc,
+        indices[i:i + 1], table, mapping[i:i + 1], **args) for i in range(rows)])
+    actual = qsa_sparse_paged_attention(q, kc, vc, indices, table, mapping,
+                                       decode_profile=True, **args)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_qsa_nvfp4_splitk_reads_value_rows():
     """A zero query makes the split-K result the selected V-row average."""
     torch.manual_seed(23)

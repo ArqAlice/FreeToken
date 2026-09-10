@@ -7,6 +7,7 @@ so no BF16 copy of the experts is ever materialized.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 import torch
@@ -157,6 +158,7 @@ def _decode_gemm_marlin(
         topk_ids.stride(0), topk_ids.stride(1),
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_KW=block_kw,
+        ARITHMETIC_DEQUANT=os.getenv("FREETOKEN_NVFP4_MOE_ARITHMETIC", "1") == "1",
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,

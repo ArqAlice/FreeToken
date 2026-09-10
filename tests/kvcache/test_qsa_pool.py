@@ -185,6 +185,15 @@ def test_kv_cost_prices_ring_and_scratch_as_fixed():
     assert fixed == 4 * row * (QSAKVCache.ring_capacity_for(4) + 1)
 
 
+def test_mtp_ring_budget_covers_four_drafts_with_ratio_two():
+    spec = _spec(index_ratio=2)
+    config = _config(spec, max_running_req=3)
+    config.model_config.qwen4_args = SimpleNamespace(mtp_num_hidden_layers=1)
+    _, fixed, _, _ = QSAKVCache.kv_cost(config)
+    row = spec.index_head_dim * spec.num_index_layers * 2
+    assert fixed == 4 * row * (6 + 1)
+
+
 def test_unit_bytes_matches_the_cost_model():
     spec = _spec()
     config = _config(spec)

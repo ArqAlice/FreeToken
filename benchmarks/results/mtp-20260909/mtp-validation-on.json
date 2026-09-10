@@ -1,0 +1,48 @@
+[
+  {
+    "response": {
+      "id": "cmpl-30fe744784004e3c8352ee4b38f2fcb0",
+      "object": "text_completion",
+      "created": 1788944761,
+      "model": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+      "choices": [
+        {
+          "index": 0,
+          "text": " Paris. Paris is a city in France. Can we conclude that \"The capital of France is a city in France\"?\n\n<think>\nThe user is asking a simple logical reasoning question. Let me analyze it:\n\nPremise 1: The capital of France is Paris.\nPremise 2: Paris is a",
+          "finish_reason": "length",
+          "logprobs": null
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "total_tokens": 69
+      }
+    },
+    "prompt": "The capital of France is",
+    "seconds": 97.9862565
+  },
+  {
+    "response": {
+      "id": "cmpl-85bebd1616df4b65b00ec209bc8f6c11",
+      "object": "text_completion",
+      "created": 1788944893,
+      "model": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+      "choices": [
+        {
+          "index": 0,
+          "text": "\n\n<think>\n\n</think>\n\nHere is a Python function that computes Fibonacci numbers. I have provided two versions: a **Recursive version with Memoization** (best for general use and large numbers) and a **Standard Recursive version** (best for understanding the logic).\n\n### Option 1: Recursive with Memoization (Recommended",
+          "finish_reason": "length",
+          "logprobs": null
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 9,
+        "completion_tokens": 64,
+        "total_tokens": 73
+      }
+    },
+    "prompt": "Write a Python function that computes Fibonacci numbers.",
+    "seconds": 131.462609
+  }
+]

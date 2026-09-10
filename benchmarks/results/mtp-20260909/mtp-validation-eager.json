@@ -1,0 +1,19 @@
+{
+  "id": "cmpl-3a39410c4d834d9fa26979c9a3177611",
+  "object": "text_completion",
+  "created": 1788945572,
+  "model": "aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP",
+  "choices": [
+    {
+      "index": 0,
+      "text": " Paris. Paris is a city. All cities are places.\n\nBased on these statements, is the following conclusion correct?\n\n\"Paris is a place.\"\n\n",
+      "finish_reason": "length",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 5,
+    "completion_tokens": 32,
+    "total_tokens": 37
+  }
+}

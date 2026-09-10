@@ -389,7 +389,8 @@ def test_triton_decode_marlin_matches_dequant_reference_after_prefill_stomp():
 
 
 @cuda
-def test_triton_decode_marlin_matches_baseline_kernel():
+@pytest.mark.parametrize("arithmetic", [False, True])
+def test_triton_decode_marlin_matches_baseline_kernel(monkeypatch, arithmetic):
     """The production marlin-style decode GEMV must match the original LUT-gather decode
     within tolerance (it only reorders the dequant math: int32 wide load + deferred reduce)."""
     from freetoken.moe.fused_nvfp4 import (
@@ -397,6 +398,7 @@ def test_triton_decode_marlin_matches_baseline_kernel():
         fused_experts_decode_nvfp4_serial,
     )
 
+    monkeypatch.setenv("FREETOKEN_NVFP4_MOE_ARITHMETIC", "1" if arithmetic else "0")
     device = torch.device("cuda")
     cache, _ = _triton_cache(device)
     torch.manual_seed(11)
@@ -409,6 +411,44 @@ def test_triton_decode_marlin_matches_baseline_kernel():
     marlin = fused_experts_decode_nvfp4_marlin(hidden, *banks, topk_weights, ids, "silu", False)
     base = fused_experts_decode_nvfp4_serial(hidden, *banks, topk_weights, ids, "silu", False)
     torch.testing.assert_close(marlin.float(), base.float(), rtol=2e-3, atol=2e-3)
+
+
+@cuda
+@pytest.mark.parametrize("shape", [(2560, 1024), (512, 2560), (272, 513)])
+@pytest.mark.parametrize("count", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("route_input", [False, True])
+def test_triton_decode_arithmetic_keeps_exact_reduction(monkeypatch, shape, count, dtype, route_input):
+    from freetoken.moe.fused_nvfp4 import _decode_gemm_marlin
+
+    torch.manual_seed(29)
+    width, out = shape
+    experts, top_k = 4, 2
+    packed = torch.randint(0, 256, (experts, out, width // 2), device="cuda", dtype=torch.uint8)
+    scale = (torch.rand(experts, out, width // 16, device="cuda") + .1).to(torch.float8_e4m3fn)
+    glob = (torch.rand(experts, out, device="cuda") + .1).to(torch.float16)
+    ids = torch.arange(count * top_k, device="cuda", dtype=torch.int32).reshape(count, top_k) % experts
+    weights = torch.rand(count, top_k, device="cuda")
+    x = torch.randn(count * top_k if route_input else count, width, device="cuda", dtype=dtype)
+    expected = torch.empty(count, top_k, out, device="cuda", dtype=dtype)
+    actual = torch.empty_like(expected)
+
+    def run(output, arithmetic):
+        monkeypatch.setenv("FREETOKEN_NVFP4_MOE_ARITHMETIC", "1" if arithmetic else "0")
+        _decode_gemm_marlin(x, packed, scale, glob, output, weights, ids, route_input, route_input)
+
+    run(expected, False)
+    run(actual, True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(actual, True)
+    for _ in range(3):
+        x.mul_(.99).add_(.013)
+        ids.add_(1).remainder_(experts)
+        run(expected, False)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_nvfp4_backend_selection():
