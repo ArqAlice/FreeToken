@@ -451,6 +451,157 @@ def test_triton_decode_arithmetic_keeps_exact_reduction(monkeypatch, shape, coun
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@cuda
+@pytest.mark.parametrize("shape", [(2560, 1280), (640, 2560), (272, 513)])
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("route_input", [False, True])
+@pytest.mark.parametrize("arithmetic", [False, True])
+def test_triton_shared_routes_graph_replay(monkeypatch, shape, count, route_input, arithmetic):
+    from freetoken.moe.fused_nvfp4 import _decode_gemm_marlin
+
+    monkeypatch.setenv("FREETOKEN_NVFP4_MOE_ARITHMETIC", str(int(arithmetic)))
+    torch.manual_seed(73)
+    width, out = shape
+    top_k, experts = 3, count * 3
+    packed = torch.randint(0, 256, (experts, out, width // 2), device="cuda", dtype=torch.uint8)
+    scale = (torch.rand(experts, out, width // 16, device="cuda") + .1).to(torch.float8_e4m3fn)
+    glob = (torch.rand(experts, out, device="cuda") + .1).half()
+    x = torch.randn(count * top_k if route_input else count, width * 2,
+                    device="cuda", dtype=torch.bfloat16)[:, ::2]
+    ids = torch.empty(count, top_k * 2, device="cuda", dtype=torch.int32)[:, ::2]
+    weights = torch.rand(count, top_k * 2, device="cuda")[:, ::2]
+    expected = torch.empty(count, top_k, out, device="cuda", dtype=x.dtype)
+    actual = torch.empty(count, top_k, out * 2, device="cuda", dtype=x.dtype)[:, :, ::2]
+    sequential = torch.arange(experts, device="cuda", dtype=torch.int32).reshape(count, top_k)
+    ids.copy_(sequential)
+
+    def run(output, shared):
+        monkeypatch.setenv("FREETOKEN_NVFP4_MOE_SHARED_ROUTES", str(int(shared)))
+        _decode_gemm_marlin(x, packed, scale, glob, output, weights, ids,
+                           not route_input, route_input)
+
+    run(actual, True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(actual, True)
+    for pattern in (sequential, sequential % top_k, sequential * 0, sequential % 4, sequential):
+        ids.copy_(pattern)
+        x.mul_(.97).add_(.01)
+        weights.mul_(.91)
+        actual.fill_(float("nan"))
+        run(expected, False)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@cuda
+@pytest.mark.parametrize("apply_on_input", [False, True])
+@pytest.mark.parametrize("activation", ["silu", "swigluoai"])
+def test_triton_shared_routes_reuses_pairing(monkeypatch, apply_on_input, activation):
+    import freetoken.moe.fused_nvfp4 as fused
+
+    sources = _make_native_sources(torch.device("cuda"), seed=43)
+    banks = [sources[name][0].cuda() for name in (
+        "gate_up_packed", "gate_up_scale", "gate_up_global",
+        "down_packed", "down_scale", "down_global")]
+    torch.manual_seed(61)
+    x = torch.randn(4, H, device="cuda", dtype=torch.bfloat16) / 4
+    ids = torch.tensor([[0, 1], [1, 2], [0, 1], [3, 0]], device="cuda", dtype=torch.int32)
+    weights = torch.rand(4, TOPK, device="cuda")
+    prepared = []
+    prepare = fused._prepare_route_pairs
+
+    def tracked(value):
+        prepared.append(value.shape)
+        return prepare(value)
+
+    monkeypatch.setattr(fused, "_prepare_route_pairs", tracked)
+
+    def run(shared):
+        monkeypatch.setenv("FREETOKEN_NVFP4_MOE_SHARED_ROUTES", str(int(shared)))
+        return fused.fused_experts_decode_nvfp4_marlin(
+            x, *banks, weights, ids, activation, apply_on_input)
+
+    run(True)
+    assert len(prepared) == 1
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run(True)
+    assert len(prepared) == 2
+    for _ in range(3):
+        ids.add_(1).remainder_(E)
+        x.mul_(.97)
+        expected = run(False)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert len(prepared) == 2
+
+
+@cuda
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("apply_on_input", [False, True])
+@pytest.mark.parametrize("activation", ["silu", "swigluoai"])
+def test_triton_grouped_routes_replays_changed_routes(monkeypatch, count, apply_on_input, activation):
+    import freetoken.moe.fused_nvfp4 as fused
+    from freetoken.kernel.triton.e4m3_compat import e4m3_native
+
+    sources = _make_native_sources(torch.device("cuda"), seed=71)
+    banks = [sources[name][0].cuda() for name in (
+        "gate_up_packed", "gate_up_scale", "gate_up_global",
+        "down_packed", "down_scale", "down_global")]
+    x = torch.randn(count, H, device="cuda", dtype=torch.bfloat16) / 4
+    ids = torch.zeros(count, TOPK, device="cuda", dtype=torch.int32)
+    weights = torch.rand(count, TOPK, device="cuda")
+    calls = []
+    original = fused._decode_grouped
+    def grouped(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(fused, "_decode_grouped", grouped)
+    monkeypatch.setenv("FREETOKEN_NVFP4_MOE_SHARED_ROUTES", "0")
+    def run(enabled):
+        monkeypatch.setenv("FREETOKEN_NVFP4_MOE_GROUPED_ROUTES", str(int(enabled)))
+        return fused.fused_experts_decode_nvfp4_marlin(x, *banks, weights, ids, activation, apply_on_input)
+    run(True)
+    expected_calls = 2 if 2 <= count <= 4 and e4m3_native() else 0
+    assert len(calls) == expected_calls
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run(True)
+    for pattern in (torch.zeros_like(ids), torch.arange(ids.numel(), device="cuda").view_as(ids) % E,
+                    torch.randint(E, ids.shape, device="cuda")):
+        ids.copy_(pattern)
+        x.mul_(.97)
+        weights.mul_(.93)
+        expected = run(False)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert len(calls) == 2 * expected_calls
+
+
+@cuda
+def test_triton_grouped_routes_splits_duplicates_into_bounded_groups():
+    import triton
+    from freetoken.kernel.triton.nvfp4_grouped import prepare_route_groups
+
+    for count in (1, 3, 9):
+        ids = torch.arange(40, device="cuda", dtype=torch.int32) % count
+        members = torch.empty(40, 4, device="cuda", dtype=torch.int32)
+        counts = torch.empty(40, device="cuda", dtype=torch.int32)
+        prepare_route_groups[(1,)](ids, members, counts, 40, triton.next_power_of_2(40), num_warps=4)
+        raw, groups, sizes = ids.tolist(), members.tolist(), counts.tolist()
+        seen = []
+        for owner, size in enumerate(sizes):
+            if not size:
+                continue
+            assert 1 <= size <= 4
+            routes = groups[owner][:size]
+            assert routes[0] == owner and routes == sorted(routes)
+            assert all(raw[r] == raw[owner] for r in routes)
+            seen.extend(routes)
+        assert sorted(seen) == list(range(40))
+
+
 def test_nvfp4_backend_selection():
     """--nvfp4-backend selection + the flashinfer/marlin device gates -- runs without a GPU
     via the CPU branch (forced backends need a usable device, so they error loudly there)."""

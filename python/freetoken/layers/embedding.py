@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict
+import os
 
 import torch
 import torch.nn.functional as F
@@ -110,7 +111,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             del indices
 
         module = self.tied_embedding or self
-        if all_tokens and x.shape[0] > 1:
+        fast_bf16 = (x.is_cuda and x.dtype == module.weight.dtype == torch.bfloat16
+                     and os.environ.get("FREETOKEN_FAST_LINEAR", "0") == "1")
+        if all_tokens and x.shape[0] > 1 and not fast_bf16:
             from .linear import rowwise_linear
 
             logits = rowwise_linear(x, module.weight, self.bias)
@@ -128,3 +131,41 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+
+class DraftFP8LMHead(BaseOP):
+    """Runtime-only FP8 copy; the target head and checkpoint remain unchanged."""
+
+    def __init__(self, source: ParallelLMHead):
+        weight = (source.tied_embedding or source).weight
+        if not weight.is_cuda or weight.dtype != torch.bfloat16:
+            raise ValueError("Draft FP8 LM head requires CUDA BF16 weights")
+        if torch.cuda.get_device_capability(weight.device) < (8, 9):
+            raise ValueError("Draft FP8 LM head requires NVIDIA SM89 or newer")
+        self._source = source
+        self.weight = torch.empty(weight.shape, device=weight.device, dtype=torch.float8_e4m3fn)
+        self.weight_scale = torch.empty(weight.shape[0], device=weight.device, dtype=torch.float32)
+        self._tail = weight.new_empty((0, weight.shape[1]))
+        for start in range(0, weight.shape[0], 1024):
+            chunk = weight[start:start + 1024].float()
+            if not torch.isfinite(chunk).all().item():
+                raise ValueError("Draft FP8 LM head weights must be finite")
+            scale = (chunk.abs().amax(1) / 448.).clamp_min(1.e-12)
+            self.weight[start:start + chunk.shape[0]] = (chunk / scale[:, None]).clamp(-448., 448.).to(self.weight.dtype)
+            self.weight_scale[start:start + chunk.shape[0]] = scale
+        self._weight_bytes = self.weight.numel() + self.weight_scale.numel() * 4
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.bf16_shared_linear import fp8_shared_linear
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            x = x[batch.attn_metadata.get_last_indices(batch.size)].contiguous()
+        logits = fp8_shared_linear(x, self.weight, self.weight_scale, self._tail)
+        source = self._source
+        if source.bias is not None:
+            logits = logits + source.bias
+        if source.tp_size == 1:
+            return logits
+        gathered = source._comm.all_gather(logits).view(source.tp_size, *logits.shape)
+        return gathered.permute(1, 0, 2).reshape(logits.shape[0], -1)[:, :source.num_embeddings]

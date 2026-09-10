@@ -8,6 +8,7 @@ so no BF16 copy of the experts is ever materialized.
 from __future__ import annotations
 
 import os
+from functools import partial
 from typing import Any, Dict
 
 import torch
@@ -20,6 +21,7 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
     _decode_nvfp4_marlin_kernel,
     _decode_nvfp4_moe_kernel,
     _e2m1_lut,
+    _pair_nvfp4_routes_kernel,
     _prefill_nvfp4_moe_kernel,
 )
 from freetoken.layers import (
@@ -121,6 +123,20 @@ def _decode_gemm(
     )
 
 
+def _shared_routes_enabled(topk_ids: torch.Tensor) -> bool:
+    return (1 < topk_ids.shape[0] <= 4 and topk_ids.numel() <= 64
+            and os.getenv("FREETOKEN_NVFP4_MOE_SHARED_ROUTES", "0") == "1")
+
+
+def _prepare_route_pairs(topk_ids: torch.Tensor) -> torch.Tensor:
+    routes = topk_ids.numel()
+    pairs = torch.empty((routes,), device=topk_ids.device, dtype=torch.int32)
+    _pair_nvfp4_routes_kernel[(routes,)](
+        topk_ids, pairs, routes, topk_ids.shape[1], *topk_ids.stride(),
+        triton.next_power_of_2(routes), num_warps=1)
+    return pairs
+
+
 def _decode_gemm_marlin(
     a: torch.Tensor,
     packed: torch.Tensor,
@@ -131,6 +147,7 @@ def _decode_gemm_marlin(
     topk_ids: torch.Tensor,
     mul_routed_weight: bool,
     a_row_is_route: bool,
+    route_pairs: torch.Tensor | None = None,
 ) -> None:
     """Marlin-style decode GEMV: int32 wide loads + deferred reduction
     (:func:`_decode_nvfp4_marlin_kernel`). ``packed`` is the uint8 ``[S, N, K//2]`` bank;
@@ -144,6 +161,8 @@ def _decode_gemm_marlin(
     deep_k = K > _DECODE_MARLIN_DEEPK_THRESHOLD
     block_n = _DECODE_MARLIN_DEEPK_BLOCK_N if deep_k else _DECODE_MARLIN_BLOCK_N
     block_kw = _DECODE_MARLIN_DEEPK_BLOCK_KW if deep_k else _DECODE_MARLIN_BLOCK_KW
+    if route_pairs is None and _shared_routes_enabled(topk_ids):
+        route_pairs = _prepare_route_pairs(topk_ids)
     grid = (total_routes, triton.cdiv(N, block_n))
     _decode_nvfp4_marlin_kernel[grid](
         a, packed_i32, scale, glob, c, topk_weights, topk_ids,
@@ -159,12 +178,34 @@ def _decode_gemm_marlin(
         BLOCK_SIZE_N=block_n,
         BLOCK_SIZE_KW=block_kw,
         ARITHMETIC_DEQUANT=os.getenv("FREETOKEN_NVFP4_MOE_ARITHMETIC", "1") == "1",
+        SHARED_ROUTES=route_pairs is not None,
+        pairs_ptr=route_pairs,
         TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         compute_type=_tl_dtype(c.dtype),
         num_warps=_DECODE_MARLIN_WARPS,
     )
+
+
+def _grouped_routes_supported(hidden, weights, ids, banks):
+    from freetoken.kernel.triton.e4m3_compat import e4m3_native
+
+    return (hidden.is_cuda and hidden.dtype == torch.bfloat16
+            and 2 <= ids.shape[0] <= 4 and ids.numel() <= 64
+            and all(t.is_contiguous() for t in (hidden, weights, ids, *banks))
+            and all(b.dtype == torch.float8_e4m3fn for b in (banks[1], banks[4]))
+            and e4m3_native())
+
+
+def _decode_grouped(a, packed, scale, glob, out, weights, ids, mul, route_input, *, members, counts):
+    from freetoken.kernel.triton.nvfp4_grouped import decode_grouped_routes
+
+    n, k = out.shape[-1], a.shape[-1]
+    block_n, block_kw = ((8, 128) if k > _DECODE_MARLIN_DEEPK_THRESHOLD else (16, 16))
+    decode_grouped_routes[(ids.numel(), triton.cdiv(n, block_n))](
+        a, packed.view(torch.int32), scale, glob, out, weights, ids, members, counts,
+        n, k, ids.shape[1], route_input, mul, block_n, block_kw, num_warps=4)
 
 
 def _fused_experts_decode_nvfp4(
@@ -191,6 +232,21 @@ def _fused_experts_decode_nvfp4(
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
+
+    if (gemm_fn is _decode_gemm_marlin
+            and os.getenv("FREETOKEN_NVFP4_MOE_GROUPED_ROUTES", "0") == "1"
+            and _grouped_routes_supported(hidden_states, topk_weights, topk_ids,
+                (gate_up_packed, gate_up_scale, gate_up_global, down_packed, down_scale, down_global))):
+        from freetoken.kernel.triton.nvfp4_grouped import prepare_route_groups
+
+        routes = topk_ids.numel()
+        members = torch.empty((routes, 4), device=dev, dtype=torch.int32)
+        counts = torch.empty(routes, device=dev, dtype=torch.int32)
+        prepare_route_groups[(1,)](topk_ids, members, counts, routes, triton.next_power_of_2(routes), num_warps=4)
+        gemm_fn = partial(_decode_grouped, members=members, counts=counts)
+    elif gemm_fn is _decode_gemm_marlin and _shared_routes_enabled(topk_ids):
+        # Both projections use the same routes; build their pairing only once.
+        gemm_fn = partial(gemm_fn, route_pairs=_prepare_route_pairs(topk_ids))
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     gemm_fn(

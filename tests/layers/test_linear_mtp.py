@@ -8,7 +8,113 @@ from freetoken.layers.linear import LinearReplicated
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
-@pytest.mark.parametrize('count', [1, 2, 3, 4, 5])
+@pytest.mark.parametrize('tied,bias', [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize('prefill', [False, True])
+def test_draft_fp8_head_keeps_target_weights(monkeypatch, tied, bias, prefill):
+    from freetoken.layers.embedding import DraftFP8LMHead
+
+    torch.manual_seed(518)
+    weight = torch.randn(513, 272, device='cuda', dtype=torch.bfloat16)
+    before = weight.clone()
+    source = SimpleNamespace(weight=weight if not tied else torch.zeros_like(weight),
+        tied_embedding=SimpleNamespace(weight=weight) if tied else None,
+        bias=torch.randn(513, device='cuda', dtype=torch.bfloat16) if bias else None, tp_size=1)
+    head = DraftFP8LMHead(source)
+    batch = SimpleNamespace(size=2, is_prefill=prefill,
+        attn_metadata=SimpleNamespace(get_last_indices=lambda n: torch.tensor([1, 3], device='cuda')))
+    # Keep metadata addresses fixed for graph replay.
+    indices = torch.tensor([1, 3], device='cuda')
+    batch.attn_metadata.get_last_indices = lambda n: indices
+    monkeypatch.setattr('freetoken.layers.embedding.get_global_ctx', lambda: SimpleNamespace(batch=batch))
+    x = torch.randn(4, 544, device='cuda', dtype=torch.bfloat16)[:, ::2]
+
+    def expected():
+        value = x[indices] if prefill else x
+        out = ((value.float() @ head.weight.float().T) * head.weight_scale).bfloat16()
+        return out + source.bias if bias else out
+
+    torch.testing.assert_close(head.forward(x), expected(), rtol=.005, atol=.002)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = head.forward(x)
+    x.mul_(.8)
+    graph.replay()
+    torch.testing.assert_close(actual, expected(), rtol=.005, atol=.002)
+    assert torch.equal(weight, before)
+    assert head._weight_bytes == weight.numel() + 4 * weight.shape[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+@pytest.mark.parametrize('enabled', [False, True])
+@pytest.mark.parametrize('tied,bias', [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize('phase', ['verify', 'prefill', 'decode'])
+def test_bf16_lm_head_fast_verification(monkeypatch, enabled, tied, bias, phase):
+    from freetoken.layers.embedding import ParallelLMHead
+    from freetoken.layers.linear import rowwise_linear
+
+    monkeypatch.setenv('FREETOKEN_FAST_LINEAR', str(int(enabled)))
+    torch.manual_seed(806)
+    weight = torch.randn(513, 272, device='cuda', dtype=torch.bfloat16)
+    head = SimpleNamespace(weight=weight if not tied else torch.zeros_like(weight),
+                           tied_embedding=SimpleNamespace(weight=weight) if tied else None,
+                           bias=torch.randn(513, device='cuda', dtype=torch.bfloat16) if bias else None,
+                           tp_size=1)
+    indices = torch.tensor([1, 3], device='cuda')
+    batch = SimpleNamespace(size=1 if phase == 'verify' else 2 if phase == 'prefill' else 4,
+                            is_prefill=phase != 'decode',
+                            attn_metadata=SimpleNamespace(get_last_indices=lambda bs: indices))
+    monkeypatch.setattr('freetoken.layers.embedding.get_global_ctx', lambda: SimpleNamespace(batch=batch))
+    x = torch.randn(4, 544, device='cuda', dtype=torch.bfloat16)[:, ::2]
+    all_tokens = phase == 'verify'
+    values = x[indices].contiguous() if phase == 'prefill' else x
+    fn = rowwise_linear if all_tokens and not enabled else F.linear
+    expected = fn(values, weight, head.bias)
+    calls = []
+    linear = F.linear
+
+    def record(values, weights, bias=None):
+        calls.append(values.shape)
+        return linear(values, weights, bias)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(F, 'linear', record)
+        actual = ParallelLMHead.forward(head, x, all_tokens=all_tokens)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert calls == ([] if all_tokens and not enabled else [values.shape])
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = ParallelLMHead.forward(head, x, all_tokens=all_tokens)
+    x.add_(.125)
+    graph.replay()
+    values = x[indices].contiguous() if phase == 'prefill' else x
+    torch.testing.assert_close(actual, fn(values, weight, head.bias), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+@pytest.mark.parametrize('shared', [False, True])
+@pytest.mark.parametrize('phase', ['decode', 'verify', 'prefill'])
+@pytest.mark.parametrize('bias', [False, True])
+def test_fast_bf16_projection_dispatch(monkeypatch, shared, phase, bias):
+    from freetoken.kernel.triton.bf16_shared_linear import bf16_shared_linear
+
+    monkeypatch.setenv('FREETOKEN_FAST_LINEAR', '1')
+    batch = SimpleNamespace(is_decode=phase == 'decode', use_decode_moe=phase == 'verify',
+                            mtp_batched_linear=False)
+    monkeypatch.setattr('freetoken.core.get_global_ctx', lambda: SimpleNamespace(batch=batch))
+    op = LinearReplicated(272, 513, has_bias=bias)
+    op.weight = torch.randn(513, 272, device='cuda', dtype=torch.bfloat16)
+    op.bias = torch.randn(513, device='cuda', dtype=torch.bfloat16) if bias else None
+    op._mtp_rowwise = True
+    op._shared_decode = shared
+    x = torch.randn(4, 272, device='cuda', dtype=torch.bfloat16)
+    expected = (bf16_shared_linear(x, op.weight) if shared and not bias and phase != 'prefill'
+                else F.linear(x, op.weight, op.bias))
+    torch.testing.assert_close(op.forward(x), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+@pytest.mark.parametrize('count', [1, 2, 3, 4, 5, 16])
 @pytest.mark.parametrize('shape', [(272, 513), (2560, 16480)])
 def test_bf16_shared_projection_fixed_reduction_graph(count, shape):
     from freetoken.kernel.triton.bf16_shared_linear import bf16_shared_linear

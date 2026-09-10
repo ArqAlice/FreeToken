@@ -76,6 +76,22 @@ class _LinearTPImpl(BaseOP):
         self._shared_decode = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (x.is_cuda and x.ndim == 2 and x.dtype == self.weight.dtype == torch.bfloat16
+                and os.environ.get("FREETOKEN_FAST_LINEAR", "0") == "1"):
+            shape = (x.shape[1], self.weight.shape[0])
+            # Shared tiles win for these small-row shapes in RTX 5090 graph measurements.
+            shared = (self._shared_decode or shape in ((6144, 2560), (2560, 2560), (2560, 1280))
+                      or x.shape[0] > 1 and shape in ((2560, 336), (2560, 512)))
+            if (shared and 1 <= x.shape[0] <= 16 and self.bias is None
+                    and self.weight.stride(1) == 1):
+                from freetoken.core import get_global_ctx
+                from freetoken.kernel.triton.bf16_shared_linear import bf16_shared_linear
+
+                batch = get_global_ctx().batch
+                if batch.is_decode or batch.use_decode_moe:
+                    return bf16_shared_linear(x, self.weight)
+            # Verification shares one GEMM across rows, including greedy sampling.
+            return F.linear(x, self.weight, self.bias)
         if (self._shared_decode and x.is_cuda and x.ndim == 2 and 1 <= x.shape[0] <= 5
                 and x.dtype == self.weight.dtype == torch.bfloat16 and self.bias is None
                 and self.weight.stride(1) == 1

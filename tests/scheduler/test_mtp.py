@@ -10,6 +10,93 @@ from freetoken.engine.speculative import verification_distribution
 from freetoken.scheduler.mtp_policy import MTPPolicy
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("count", range(1, 6))
+@pytest.mark.parametrize("start", [1, 63, 8191])
+@pytest.mark.parametrize("bucketed", [True, False])
+def test_small_batch_metadata_matches_scheduler_and_restages(count, start, bucketed):
+    from freetoken.attention.qsa_sparse import QSASparseAttnBackend
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.scheduler.mtp_batch import prepare_small_batch
+    from freetoken.core import Batch
+
+    device = torch.device("cuda")
+    table = torch.arange(3 * 16384, device=device, dtype=torch.int32).reshape(3, 16384)
+    table[:, -64:] = -1
+    backend = object.__new__(QSASparseAttnBackend)
+    backend.device, backend.page_size = device, 64
+    backend._block_topk_kernel = object() if bucketed else None
+    backend._block_base_view = lambda: table[:, ::64]
+    scheduler = SimpleNamespace(device=device, _forward_iter=0,
+        engine=SimpleNamespace(page_table=table, linear_state_pool=object(), attn_backend=backend,
+            graph_runner=SimpleNamespace(pad_batch=lambda b: setattr(b, "padded_reqs", b.reqs))),
+        cache_manager=SimpleNamespace(is_hybrid=False, free_swa_out_of_window_extend=lambda reqs: None),
+        _gather_multimodal=lambda batch: None)
+    buffers = {}
+    snapshots = []
+    for slot in (2, 0, 1):
+        req = SimpleNamespace(cached_len=start, device_len=start+count, extend_len=count,
+            table_idx=slot, linear_slot_idx=(slot+1)%3, mamba_ping_pong=None, can_decode=True)
+        reference = Batch([req], "prefill")
+        Scheduler._prepare_batch(scheduler, reference, allocate=False, sample=False)
+        actual = Batch([req], "prefill")
+        prepare_small_batch(actual, table, backend, buffers)
+        for name in ("positions", "out_loc"):
+            torch.testing.assert_close(getattr(actual, name), getattr(reference, name), rtol=0, atol=0)
+        for name in ("last_indices", "qo_indptr_cpu", "kv_len_cpu", "token_to_req", "cu_seqlens",
+                     "seq_lens", "ring_slots", "block_table"):
+            torch.testing.assert_close(getattr(actual.attn_metadata, name),
+                                       getattr(reference.attn_metadata, name), rtol=0, atol=0)
+        for name in ("cu_seqlens", "cache_indices", "has_initial_state"):
+            torch.testing.assert_close(getattr(actual.fla_metadata, name),
+                                       getattr(reference.fla_metadata, name), rtol=0, atol=0)
+        assert actual.fla_metadata.fresh_state_indices is None
+        snapshots.append(actual.attn_metadata)
+    assert len(buffers) == 1
+    assert snapshots[0].kv_len_cpu.tolist() == [start+count]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_small_batch_metadata_survives_graph_staging_and_slot_reuse():
+    from freetoken.attention.qsa_sparse import QSASparseAttnBackend
+    from freetoken.scheduler.mtp_batch import prepare_small_batch
+    from freetoken.core import Batch
+
+    table = torch.arange(2 * 16384, dtype=torch.int32, device="cuda").view(2, -1)
+    backend = object.__new__(QSASparseAttnBackend)
+    backend.page_size, backend._block_topk_kernel = 64, object()
+    buffers, graphs, old_metadata = {}, {}, []
+    for slot, start, count in [(0, 63, 2), (1, 511, 2), (0, 8191, 3), (1, 8192, 3), (0, 127, 2)]:
+        req = SimpleNamespace(cached_len=start, device_len=start+count, extend_len=count,
+                              table_idx=slot, linear_slot_idx=None)
+        batch = Batch([req], "prefill")
+        prepare_small_batch(batch, table, backend, buffers)
+        batch.input_ids = torch.arange(count, device="cuda", dtype=torch.int32)
+        key = count, batch.attn_metadata.block_table.shape[1]
+        if key not in graphs:
+            static, bindings = MTPRunner._static_batch(batch)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = (static.positions + static.out_loc + static.attn_metadata.seq_lens
+                          + static.fla_metadata.cache_indices + static.attn_metadata.block_table[:, 0])
+            graphs[key] = graph, static, bindings, result
+        graph, static, bindings, result = graphs[key]
+        MTPRunner._stage_batch(batch, static, bindings)
+        graph.replay()
+        expected = (torch.arange(start, start+count, device="cuda", dtype=torch.int32) * 2
+                    + slot * 16384 + start+count + slot + slot * 256)
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        old_metadata.append((batch.attn_metadata, start+count))
+    for metadata, end in old_metadata:
+        assert metadata.kv_len_cpu.tolist() == [end]
+
+
+def test_small_batch_falls_back_for_other_backends(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_MTP_FAST_PREPARE", "1")
+    runner = MTPRunner(SimpleNamespace(engine=SimpleNamespace(attn_backend=object())))
+    assert not runner._prepare_small_batch(SimpleNamespace(use_decode_moe=True))
+
+
 def _observe_cost(policy, depth, cost, emitted=1):
     for _ in range(policy.min_samples):
         policy.observe(depth, cost * emitted, emitted)
@@ -363,12 +450,14 @@ def test_verify_commit_and_page_boundary_rollback(accepted, greedy, greedy_draft
         cache_manager=cm, config=SimpleNamespace(page_size=4),
     )
     runner = MTPRunner(scheduler)
+    runner._speculative_cache = True
     runner.drafts[1] = torch.tensor([3], dtype=torch.int32)
     runner.draft_probs[1] = torch.nn.functional.one_hot(torch.tensor([3]), 8).float()
     runner._batch = lambda req, start, end, ids: ids
     calls = []
 
     def target(ids, all_tokens=False, compute_logits=True):
+        assert getattr(ids, "mtp_confirmed_rows", None) == (1 if all_tokens else None)
         calls.append(ids.tolist())
         states.add_(ids.numel())
         ring.add_(ids.numel())
@@ -424,7 +513,8 @@ def test_chunked_draft_preserves_shifted_residual_alignment():
     assert not runner.drafts
 
 
-def test_draft_reuses_matching_target_metadata():
+@pytest.mark.parametrize("confirmed", [None, 0, 1])
+def test_draft_reuses_matching_target_metadata(confirmed):
     seen = []
     runner = MTPRunner(SimpleNamespace(engine=SimpleNamespace(
         ctx=SimpleNamespace(forward_batch=lambda batch: nullcontext()),
@@ -436,7 +526,7 @@ def test_draft_reuses_matching_target_metadata():
     runner._head = lambda ids, states, batch, **kw: (runner.engine.model.forward_mtp(ids, states, batch), states)
     runner._batch = unexpected
     req = SimpleNamespace(uid=1, sampling_params=SamplingParams())
-    batch = SimpleNamespace(reqs=[SimpleNamespace(cached_len=5, extend_len=2)])
+    batch = SimpleNamespace(reqs=[SimpleNamespace(cached_len=5, extend_len=2)], mtp_confirmed_rows=confirmed)
     histories = {name: object() for name in ("mtp_recurrent_history", "mtp_state_indices",
                                             "mtp_conv_inputs", "mtp_ple_inputs")}
     for name, value in histories.items():
@@ -445,6 +535,8 @@ def test_draft_reuses_matching_target_metadata():
                   torch.tensor(3), batch)
     assert len(seen) == 1
     assert seen[0].reqs is batch.reqs
+    assert seen[0].mtp_confirmed_rows is None
+    assert batch.mtp_confirmed_rows == confirmed
     for name, value in histories.items():
         assert getattr(seen[0], name) is None
         assert getattr(batch, name) is value
@@ -453,8 +545,10 @@ def test_draft_reuses_matching_target_metadata():
 @pytest.mark.parametrize("greedy,greedy_draft", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("count,accepted", [(n, a) for n in range(1, 5) for a in range(n + 1)])
 @pytest.mark.parametrize("end", [4, 6, 7])
-def test_multi_token_prefix_rollback(greedy, greedy_draft, count, accepted, end, monkeypatch):
+@pytest.mark.parametrize("shortened", [False, True])
+def test_multi_token_prefix_rollback(greedy, greedy_draft, count, accepted, end, shortened, monkeypatch):
     monkeypatch.setenv("FREETOKEN_MTP_GREEDY_DRAFT", str(int(greedy_draft)))
+    requested = min(4, count + 2) if shortened else count
     state = torch.zeros(1, 1, 1)
     ring = torch.zeros(1, 1)
     allocated, freed, calls = [], [], []
@@ -485,7 +579,7 @@ def test_multi_token_prefix_rollback(greedy, greedy_draft, count, accepted, end,
         runner.draft_probs[1] = q[:1]
 
     def lookahead(req, first, probs, n):
-        assert n == count
+        assert n == requested
         state.add_(100)
         ring.add_(100)
         return draft, None if greedy_draft else q
@@ -513,14 +607,14 @@ def test_multi_token_prefix_rollback(greedy, greedy_draft, count, accepted, end,
     runner._target = target
     runner._sample_args = lambda batch: None
     req = SimpleNamespace(uid=1, cached_len=end - 1, device_len=end, table_idx=0,
-        linear_slot_idx=None, remain_len=count + 1, sampling_params=SimpleNamespace(is_greedy=greedy))
+        linear_slot_idx=None, remain_len=requested + 1, sampling_params=SimpleNamespace(is_greedy=greedy))
     tokens = runner._one(req, "decode")
     assert tokens.tolist() == draft[:accepted].tolist() + [7]
-    assert allocated == [(end, end + count)]
+    assert allocated == [(end, end + requested)]
     assert (req.cached_len, req.device_len) == (end + accepted, end + accepted + 1)
     assert state.item() == ring.item() == accepted + 1
     assert calls == [[0] + draft.tolist()] + ([[0] + draft[:accepted].tolist()] if accepted < count else [])
-    assert freed == list(range(((end + accepted + 3) // 4) * 4, ((end + count + 3) // 4) * 4))
+    assert freed == list(range(((end + accepted + 3) // 4) * 4, ((end + requested + 3) // 4) * 4))
     assert (runner.proposed, runner.accepted) == (count, accepted)
 
 
@@ -628,19 +722,22 @@ def test_qsa_head_counts_completed_work_and_invalidates_after_failure():
     assert (runner.qsa_refreshed_heads, runner.qsa_reused_heads) == (1, 1)
 
 
-def test_lookahead_passes_head_residual_and_positions():
+@pytest.mark.parametrize("speculative_cache", [False, True])
+def test_lookahead_passes_head_residual_and_positions(speculative_cache):
     seen = []
 
     def head(ids, hidden, batch, *, return_residual):
         assert return_residual
-        seen.append((ids.item(), hidden.item(), batch))
+        assert getattr(batch, "mtp_confirmed_rows", None) == (0 if speculative_cache else None)
+        seen.append((ids.item(), hidden.item(), (batch.start, batch.end)))
         return torch.tensor([[0., 0., 1.]]), hidden + 10
 
     runner = MTPRunner(SimpleNamespace(engine=SimpleNamespace(
         ctx=SimpleNamespace(forward_batch=lambda batch: nullcontext()),
         model=SimpleNamespace(forward_mtp=head))))
     runner._head = lambda ids, states, batch, **kw: head(ids, states, batch, return_residual=True)
-    runner._batch = lambda req, start, end, ids, **kw: (start, end)
+    runner._speculative_cache = speculative_cache
+    runner._batch = lambda req, start, end, ids, **kw: SimpleNamespace(start=start, end=end)
     runner.draft_states[1] = torch.tensor([[5.]])
     req = SimpleNamespace(uid=1, cached_len=9, sampling_params=SamplingParams())
     tokens, probs = runner._lookahead(req, torch.tensor([1]), None, 4)
@@ -648,6 +745,71 @@ def test_lookahead_passes_head_residual_and_positions():
     assert tokens.tolist() == [1, 2, 2, 2]
     assert probs is None
     assert not runner.draft_states
+
+
+@pytest.mark.parametrize("threshold,expected", [(0, 4), (.5, 3), (.8, 2), (.95, 1)])
+def test_lookahead_stops_after_uncertain_prefix(monkeypatch, threshold, expected):
+    monkeypatch.setenv("FREETOKEN_MTP_DRAFT_MIN_PROB", str(threshold))
+    calls = []
+    predictions = [torch.tensor([[.6, .2, .2]]), torch.tensor([[.4, .3, .3]]),
+                   torch.tensor([[.9, .05, .05]])]
+    sampler = SimpleNamespace(probabilities=lambda logits, args: logits,
+                              sample_probs=lambda p: p.argmax(-1))
+    runner = MTPRunner(SimpleNamespace(engine=SimpleNamespace(sampler=sampler)))
+    runner._batch = lambda *a, **kw: None
+    runner._sample_args = lambda batch: None
+    runner.draft_states[1] = torch.zeros(1, 1)
+
+    def head(ids, state, batch, **kw):
+        output = predictions[len(calls)]
+        calls.append(ids.clone())
+        return output, state + 1
+
+    runner._head = head
+    req = SimpleNamespace(uid=1, cached_len=9, sampling_params=SamplingParams(temperature=1))
+    first = torch.tensor([[.9, .05, .05]])
+    tokens, probs = runner._lookahead(req, torch.tensor([2]), first, 4)
+    assert tokens.tolist() == [2] + [0] * (expected - 1)
+    torch.testing.assert_close(probs, torch.cat([first] + predictions[:expected - 1]))
+    assert len(calls) == expected - 1
+    assert runner.draft_stops == int(expected < 4)
+    assert not runner.draft_states
+
+
+@pytest.mark.parametrize("threshold", ["nan", "inf", "-0.1", "1.1"])
+def test_invalid_draft_confidence_threshold(monkeypatch, threshold):
+    monkeypatch.setenv("FREETOKEN_MTP_DRAFT_MIN_PROB", threshold)
+    with pytest.raises(ValueError, match="DRAFT_MIN_PROB"):
+        MTPRunner(SimpleNamespace(engine=None))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("top_k,top_p", [(0, 1.), (20, 1.), (0, .95), (20, .95)])
+def test_draft_probability_graph_retains_distributions(monkeypatch, top_k, top_p):
+    from freetoken.engine.sample import Sampler
+
+    monkeypatch.setenv("FREETOKEN_MTP_DRAFT_PROBS_GRAPH", "1")
+    sampler = Sampler(torch.device("cuda"), 513)
+    runner = MTPRunner(SimpleNamespace(engine=SimpleNamespace(
+        sampler=sampler, stream=torch.cuda.current_stream())))
+    req = SimpleNamespace(uid=1, sampling_params=SamplingParams(temperature=.8, top_k=top_k, top_p=top_p))
+    batch = SimpleNamespace(reqs=[req])
+    logits = torch.randn(1, 513, device="cuda", dtype=torch.bfloat16)
+    expected = sampler.probabilities(logits, runner._sample_args(batch))
+    state = torch.cuda.get_rng_state()
+    first = runner._draft_probabilities(logits, batch)
+    torch.testing.assert_close(first, expected, rtol=0, atol=0)
+    logits.mul_(-.7)
+    second = runner._draft_probabilities(logits, batch)
+    torch.testing.assert_close(second, sampler.probabilities(logits, runner._sample_args(batch)), rtol=0, atol=0)
+    torch.testing.assert_close(first, expected, rtol=0, atol=0)
+    assert torch.equal(state, torch.cuda.get_rng_state())
+    assert len(runner._probability_graphs) == 1
+    req.sampling_params.temperature = .5
+    runner._draft_probabilities(logits, batch)
+    assert len(runner._probability_graphs) == 2
+    runner.close()
+    assert not runner._probability_graphs
 
 
 def test_full_cache_falls_back_without_allocating_speculation():
@@ -916,6 +1078,105 @@ def test_tracked_rejection_commits_prefix_without_second_target(monkeypatch, acc
     assert (req.cached_len, req.device_len) == (end + accepted, end + accepted + 1)
     assert freed == (list(range(40, 44)) if accepted == 0 else [])
     torch.testing.assert_close(pool.recurrent_states[:, 2], torch.full_like(pool.recurrent_states[:, 2], 1000 + accepted))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("start", [0, 6, 7])
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_device_commit_matches_reference_and_replays_dynamic_acceptance(start, compact, dtype):
+    with torch.device("cuda"):
+        runner = _history_runner()
+        pool = runner.engine.linear_state_pool
+        pool.conv_states = pool.conv_states.to(dtype)
+        pool.slot_states["ple_conv"] = pool.slot_states["ple_conv"].to(dtype)
+        runner.engine.kv_cache._pending_ring = runner.engine.kv_cache._pending_ring.to(dtype)
+        req = SimpleNamespace(table_idx=1, linear_slot_idx=2, cached_len=start)
+        batch = SimpleNamespace(use_decode_moe=True, input_ids=torch.arange(21, 26, dtype=torch.int32))
+        assert runner._track_verification(batch)
+        batch.mtp_recurrent_history.copy_(torch.randn_like(batch.mtp_recurrent_history))
+        batch.mtp_conv_inputs.copy_(torch.randn_like(batch.mtp_conv_inputs))
+        for inputs in batch.mtp_ple_inputs.values():
+            inputs.copy_(torch.randn_like(inputs))
+        saved = runner._snapshot(req, recurrent=not compact)
+        pool = runner.engine.linear_state_pool
+        tensors = [pool.recurrent_states, pool.conv_states, *pool.slot_states.values(),
+                   runner.engine.kv_cache._pending_ring]
+        for tensor in tensors:
+            tensor.add_(10000)
+        verified = [tensor.clone() for tensor in tensors]
+        accepted = torch.zeros((), dtype=torch.int64)
+        runner._commit_prefix_device(req, saved, batch, accepted)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            runner._commit_prefix_device(req, saved, batch, accepted)
+        for count in (0, 3, 1, 4, 2):
+            for tensor, value in zip(tensors, verified):
+                tensor.copy_(value)
+            if count < 4:
+                runner._commit_prefix(req, (saved[0], saved[1], saved[2].clone()), batch, count + 1)
+            expected = [tensor.clone() for tensor in tensors]
+            for tensor, value in zip(tensors, verified):
+                tensor.copy_(value)
+            accepted.fill_(count)
+            graph.replay()
+            for actual, reference in zip(tensors, expected):
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("accepted", range(5))
+@pytest.mark.parametrize("greedy,greedy_draft", [(True, False), (False, False), (False, True)])
+def test_device_commit_integration_preserves_tokens_pages_and_history(monkeypatch, accepted, greedy, greedy_draft):
+    monkeypatch.setenv("FREETOKEN_MTP_FUSED_COMMIT", "1")
+    monkeypatch.setenv("FREETOKEN_MTP_GREEDY_DRAFT", str(int(greedy_draft)))
+    with torch.device("cuda"):
+        runner = _history_runner()
+        runner.scheduler.config = SimpleNamespace(page_size=4, mtp_speculative_tokens=4)
+        runner.scheduler.token_pool = torch.zeros(3, 32, dtype=torch.int32)
+        freed, targets, drafts = [], [], []
+        runner.scheduler.cache_manager = SimpleNamespace(free_slots=list(range(4)),
+            allocate_paged=lambda reqs: None, page_table=torch.arange(96).reshape(3, 32),
+            _free=lambda slots: freed.extend(slots.tolist()))
+        req = SimpleNamespace(uid=19, cached_len=7, device_len=8, table_idx=1,
+            linear_slot_idx=2, remain_len=5, sampling_params=SamplingParams(temperature=0. if greedy else 1.))
+        draft = torch.arange(1, 5, dtype=torch.int32)
+        q = torch.nn.functional.one_hot(draft.long(), 8).float()
+        runner.drafts[req.uid] = draft[:1]
+        runner.draft_probs[req.uid] = q[:1]
+        runner._lookahead = lambda *a: (draft, q)
+        runner._batch = lambda req, start, stop, ids: SimpleNamespace(use_decode_moe=True, input_ids=ids)
+        runner._sample_args = lambda batch: None
+        runner.engine.sampler = SimpleNamespace(probabilities=lambda logits, args: logits,
+            sample_probs=lambda p: p.argmax(-1),
+            sample_speculative=lambda p, q, n: verification_distribution(p, q, n).argmax(-1))
+        residual = torch.arange(15).reshape(5, 3).float()
+
+        def target(batch, **kw):
+            targets.append(batch.input_ids.numel())
+            for step in range(5):
+                batch.mtp_recurrent_history[:, 0, step].fill_(1000 + step)
+            batch.mtp_conv_inputs.zero_()
+            for inputs in batch.mtp_ple_inputs.values():
+                inputs.zero_()
+            runner.engine.linear_state_pool.recurrent_states[:, 2].fill_(1004)
+            predictions = torch.tensor([1, 2, 3, 4, 7])
+            predictions[accepted] = 7
+            return torch.nn.functional.one_hot(predictions, 8).float(), residual
+
+        runner._target = target
+        runner._draft = lambda req, start, states, ids, token, batch: drafts.append(states.clone())
+        tokens = runner._one(req, "decode")
+        assert tokens.tolist() == draft[:accepted].tolist() + [7]
+        assert targets == [5]
+        assert (req.cached_len, req.device_len) == (8 + accepted, 9 + accepted)
+        assert freed == (list(range(40, 44)) if accepted == 0 else [])
+        torch.testing.assert_close(drafts[0], residual[:accepted + 1])
+        state = runner.engine.linear_state_pool.recurrent_states[:, 2]
+        torch.testing.assert_close(state, torch.full_like(state, 1000 + accepted))
+        assert runner._acceptance_transfer[0].is_pinned()
+        runner.close()
+        assert runner._acceptance_transfer is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

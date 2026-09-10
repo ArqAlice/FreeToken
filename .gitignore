@@ -231,6 +231,3 @@ benchmarks/cross_framework
 # local Dockerfile
 compose.yaml
 Dockerfile
-
-# benchmarks
-benchmarks

@@ -112,6 +112,139 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
+### MTP speculative decoding
+
+MTP uses the checkpoint's prediction head to propose tokens and verifies them
+with the main model. It supports greedy generation and sampling with temperature,
+top-k and top-p. This implementation requires a Qwen4-family checkpoint with
+exactly one MTP layer and one GPU (TP=1). The tested checkpoint is
+`aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--mtp-speculative-tokens N` | `0` | Maximum draft tokens per verification: `0` disables MTP; `1` through `4` enable it. Start with `1`. |
+| `--mtp-auto` | off | Choose depth from measured time per emitted token for each request. Requires a positive `--mtp-speculative-tokens`; the automatic ceiling is `min(N, 3)`. |
+
+For a first comparison, enable one draft token:
+
+```bash
+ft serve --model aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP \
+  --mtp-speculative-tokens 1
+```
+
+To let the server try depths 0, 1, 2 and 3:
+
+```bash
+ft serve --model aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP \
+  --mtp-speculative-tokens 3 --mtp-auto
+```
+
+Auto mode calibrates per request and can stop speculation for the rest of that
+request when it is unprofitable. A new request calibrates again. It is a heuristic,
+not a guarantee of the fastest setting; calibration and first-use CUDA graph
+capture can make short replies slower. Server logs report depth changes and
+estimated milliseconds per token. To disable MTP, set
+`--mtp-speculative-tokens 0` and remove `--mtp-auto`.
+
+MTP is a server setting. OpenWebUI and other API clients need no MTP-specific
+request option: keep using their normal temperature, top-p, top-k and output
+limits. Unspecified sampling values follow `--sampling-defaults`. Equal random
+seeds do not guarantee identical sampled text with MTP enabled and disabled.
+
+Larger lookahead can be slower, especially when experts must be fetched from
+CPU memory or many proposals are rejected. MTP also disables prefix-cache reuse
+and overlap scheduling; speculative requests currently run serially within a
+batch. These restrictions can affect repeated conversations and concurrent use.
+Automatic depth-zero sampling can use ordinary batched decode.
+
+#### Docker Compose
+
+Append these entries to the serving service's existing `command` list, or replace
+the value of an existing MTP argument. Keep its model and other serving arguments:
+
+```yaml
+- --mtp-speculative-tokens
+- "3"
+- --mtp-auto
+```
+
+For fixed depth one, use `"1"` and omit `--mtp-auto`. Environment variables below
+belong in the service's `environment` mapping, for example:
+
+```yaml
+FREETOKEN_MTP_FAST_PREPARE: "1"
+FREETOKEN_MTP_DRAFT_MIN_PROB: "0.5"
+```
+
+Restart the serving process after changing MTP arguments or environment variables.
+If the image copies source at build time, rebuild it to pick up code changes:
+
+```bash
+docker compose up -d --build <service-name>
+```
+
+Replace `<service-name>` with your existing serving service name. Changing the
+Compose file without recreating the container does not apply the new settings.
+
+#### Optional performance settings
+
+These are environment variables, not `ft serve` arguments. All options in this
+table are disabled by default. Try changes individually and compare warmed
+requests on your workload before combining them.
+
+| Variable | Suggested trial | Effect and tradeoff |
+|---|---|---|
+| `FREETOKEN_MTP_FAST_PREPARE` | `1` | Reduces metadata preparation for short single-request QSA continuations. Does not change model arithmetic or sampling; unsupported paths use ordinary preparation. |
+| `FREETOKEN_MTP_DRAFT_MIN_PROB` | `0.5` | Stops additional stochastic lookahead when the largest filtered draft probability is below this threshold. Valid range `0`-`1`; `0` disables it. Keeps proposals already generated. Most useful to try with maximum depth 2 or 3; does not apply to greedy proposals. Can change seeded text and adds a confidence-check cost. |
+| `FREETOKEN_FAST_LINEAR` | `1` | Uses batched/shared-weight BF16 projections, including the vocabulary head and greedy verification. Changes rounding and can change generated text. Also affects MTP-off execution. |
+| `FREETOKEN_GDN_FP8_INPUT` | `1` | Converts unquantized Qwen4 GDN input weights to FP8 at load time, keeping activations BF16. Requires SM89 or newer. Saves about 1.40 GiB for the tested checkpoint; adds numerical approximation and can change text. Also affects MTP-off execution; the checkpoint on disk stays unchanged. |
+| `FREETOKEN_EXPERT_LRFU_HALF_LIFE` | `256` | Uses decayed access frequency for GPU expert retention. Integer range `0`-`4096`; `0` keeps the default policy. Alters cache behavior, not weight precision; gains depend on routing. |
+| `FREETOKEN_EXPERT_LAYER_DISTANCE` | `2` | Adds layer distance to expert eviction decisions. Range `0`-`16`; requires a positive LRFU half-life. Also affects ordinary GPU offload decoding. |
+
+Fast BF16 and GDN FP8 can be enabled separately. Fast BF16 includes the shared
+GDN projection path and takes precedence over the older BF16 rowwise/batched/
+parallel switches. Exact greedy MTP-on/off output equality is not promised with
+these speed-first settings. Evaluate answer quality as well as throughput.
+
+For CPU expert offload, automatic cache sizing can use memory reclaimed by GDN
+FP8 for more experts. A fixed `--moe-cache-size` stays fixed. Likewise, reserving
+more KV capacity leaves less VRAM for experts: choose `--max-seq-len-override`
+and `--kv-reserve-tokens` for the context capacity you actually need. Reducing
+capacity is a separate tradeoff, not an MTP kernel speedup. `--kv-cache-dtype`
+controls KV storage independently of GDN FP8 weights.
+
+#### Additional experiments and diagnostic switches
+
+These switches are available for targeted comparisons. They are not required
+to enable MTP, and enabling all of them is not a recommended speed preset.
+
+| Variable | Default | Purpose / limitation |
+|---|---|---|
+| `FREETOKEN_MTP_FUSED_COMMIT` | `0` | GPU accepted-prefix state updates; only a small full-generation gain was measured. |
+| `FREETOKEN_MTP_DRAFT_FP8_HEAD` | `0` | FP8 copy of the draft vocabulary head; CUDA BF16 source weights and SM89+ required. Adds about 607 MiB for the tested checkpoint and reduces available expert-cache memory. Target head is unchanged. |
+| `FREETOKEN_MTP_DRAFT_PROBS_GRAPH` | `0` | CUDA graphs for draft probability calculation. No consistent full-generation gain measured on its own. |
+| `FREETOKEN_MTP_GREEDY_DRAFT` | `0` | Deterministic draft proposals with stochastic target sampling. Reduced acceptance and throughput in the tested chat workload. |
+| `FREETOKEN_MTP_QSA_REUSE` | `0` | Reuses draft-only QSA selections for depths 2-4. Can change draft probabilities; short-chat gains were not established. |
+| `FREETOKEN_MTP_EXPERT_SPEC_WEIGHT` | `1` | LRFU credit for experts used only by unverified rows; range `(0, 1]`, values below `1` require positive LRFU half-life. Leave at `1` initially: lower credit did not establish reduced transfer volume. |
+| `FREETOKEN_NVFP4_MOE_SHARED_ROUTES` | `0` | Shares resident NVFP4 expert reads between pairs of routes. No consistent chat throughput gain established. |
+| `FREETOKEN_NVFP4_MOE_GROUPED_ROUTES` | `0` | Groups up to four matching routes; takes precedence over pairing where supported. Improved isolated MoE timing, but not full chat throughput consistently. |
+| `FREETOKEN_GDN_SHARED_INPUT` | `0` | Shared BF16 GDN input projection. Can change rounding; already included in fast-linear mode. |
+| `FREETOKEN_MTP_BATCHED_LINEAR` | `0` | Older batched BF16 experiment for non-greedy verification; can change numerical results. Superseded by fast-linear mode when that is enabled. |
+| `FREETOKEN_MTP_PARALLEL_LINEAR` | `0` | Parallel single-row BF16 execution for selected shapes; measured gains were small. Superseded by fast-linear mode when enabled. |
+| `FREETOKEN_MTP_EXPERT_STATS` | `0` | Adds confirmed/speculative expert access and miss counters with LRFU. Diagnostic overhead; leave off for normal serving. |
+| `FREETOKEN_MTP_CUDA_GRAPH` / `FREETOKEN_MTP_DRAFT_GRAPH` | `1` | Target/draft continuation graphs. Set to `0` only to compare eager execution. |
+| `FREETOKEN_MTP_STATE_HISTORY` | `1` | Saves prefix states to avoid target replay after rejection. `0` selects restore-and-replay. |
+| `FREETOKEN_MTP_EXPERT_OVERLAP` / `FREETOKEN_MTP_ASYNC_PLE` | `1` | Overlap expert fetching / stage disk PLE asynchronously where supported. `0` disables the respective path for comparison. |
+| `FREETOKEN_MTP_NVFP4_SHARED_ROWS` / `FREETOKEN_NVFP4_MOE_ARITHMETIC` | `1` | Existing NVFP4 projection weight reuse / expert unpacking optimizations. Normally leave enabled. |
+
+For a useful speed comparison, keep the same model, prompt, sampling settings,
+output budget, context capacity, expert-cache budget and precision settings.
+Compare MTP off, fixed depth one, then auto or deeper lookahead over several
+warmed requests. Check both first-token latency and decode tokens/s. Auto falling
+back to zero and an isolated kernel improvement do not establish faster active
+MTP. Short-chat measurements on the tested 32 GB system have not established a
+consistent large advantage over MTP off.
+
 ### API behaviour
 
 | Flag | Default | Meaning |

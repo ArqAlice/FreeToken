@@ -138,6 +138,77 @@ def _decode_nvfp4_moe_kernel(
 
 
 @triton.jit
+def _pair_nvfp4_routes_kernel(
+    ids_ptr, pairs_ptr, total_routes: tl.constexpr, top_k: tl.constexpr,
+    stride_m: tl.constexpr, stride_k: tl.constexpr, block: tl.constexpr,
+):
+    route = tl.program_id(0)
+    routes = tl.arange(0, block)
+    slot = tl.load(ids_ptr + route // top_k * stride_m + route % top_k * stride_k)
+    slots = tl.load(ids_ptr + routes // top_k * stride_m + routes % top_k * stride_k,
+                    routes < total_routes, other=-1)
+    matches = (slots == slot) & (routes < total_routes)
+    rank = tl.sum((matches & (routes < route)).to(tl.int32), 0)
+    partner = tl.min(tl.where(matches & (routes > route), routes, total_routes), 0)
+    # Even matching ranks own pairs; odd ranks skip so each output has one writer.
+    tl.store(pairs_ptr + route, tl.where(rank % 2 == 0, partner, -1))
+
+
+@triton.jit
+def _decode_nvfp4_shared_project(
+    a_base, partner_base, packed_slot, scale_slot, lut_ptr, offs_n, n_mask,
+    N, K, stride_ak, stride_pn, stride_pkw, stride_sn, stride_sblk,
+    BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_KW: tl.constexpr,
+    ARITHMETIC_DEQUANT: tl.constexpr, SHARED_ROUTES: tl.constexpr,
+):
+    offs_kw = tl.arange(0, BLOCK_SIZE_KW)
+    K_WORDS = K // 8
+    partial = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
+    if SHARED_ROUTES:
+        partial_partner = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW)):
+        widx = kw_start * BLOCK_SIZE_KW + offs_kw
+        w_mask = widx < K_WORDS
+
+        word = tl.load(
+            packed_slot + offs_n[None, :] * stride_pn + widx[:, None] * stride_pkw,
+            mask=w_mask[:, None] & n_mask[None, :], other=0,
+        )
+        # 8 codes/word fall in the same or adjacent 16-wide block -> one scale per word.
+        s_ptrs = scale_slot + offs_n[None, :] * stride_sn + (widx[:, None] // 2) * stride_sblk
+        s_mask = w_mask[:, None] & n_mask[None, :]
+        if e4m3_native_cx():
+            scale = tl.load(s_ptrs, mask=s_mask, other=0.0).to(tl.float32)
+        else:
+            scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=s_mask, other=0))
+
+        kbase = 8 * widx
+        acc_w = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
+        if SHARED_ROUTES:
+            acc_partner = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
+        for j in tl.static_range(8):
+            code = (word >> (4 * j)) & 0xF
+            if ARITHMETIC_DEQUANT:
+                b = _e2m1_arithmetic(code)
+            else:
+                b = tl.load(lut_ptr + code)
+            a_j = tl.load(a_base + (kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+            acc_w += a_j[:, None] * b
+            if SHARED_ROUTES:
+                a_partner = tl.load(partner_base + (kbase + j) * stride_ak,
+                                    mask=w_mask, other=0.0).to(tl.float32)
+                acc_partner += a_partner[:, None] * b
+        partial += acc_w * scale
+        if SHARED_ROUTES:
+            partial_partner += acc_partner * scale
+
+    accumulator = tl.sum(partial, axis=0)
+    partner_result = tl.sum(partial_partner, axis=0) if SHARED_ROUTES else tl.full((BLOCK_SIZE_N,), 0, tl.float32)
+    return accumulator, partner_result
+
+
+@triton.jit
 def _decode_nvfp4_marlin_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 8] int32 (8 fp4 codes per word, nibble j -> k=8*w+j)
@@ -164,6 +235,8 @@ def _decode_nvfp4_marlin_kernel(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
     ARITHMETIC_DEQUANT: tl.constexpr = False,
+    SHARED_ROUTES: tl.constexpr = False,
+    pairs_ptr=None,
 ):
     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
 
@@ -192,41 +265,33 @@ def _decode_nvfp4_marlin_kernel(
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
 
-    offs_kw = tl.arange(0, BLOCK_SIZE_KW)
-    K_WORDS = K // 8
-    partial = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
+    if SHARED_ROUTES:
+        partner = tl.load(pairs_ptr + route_id)
+        if partner < 0:
+            return
+        partner_valid = partner < total_routes
+        partner_row = partner if A_ROW_IS_ROUTE else partner // TOP_K
+        partner_base = a_ptr + partner_row * stride_am
 
     packed_slot = packed_ptr + slot * stride_pe
     scale_slot = scale_ptr + slot * stride_se
-    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW)):
-        widx = kw_start * BLOCK_SIZE_KW + offs_kw
-        w_mask = widx < K_WORDS
-
-        word = tl.load(
-            packed_slot + offs_n[None, :] * stride_pn + widx[:, None] * stride_pkw,
-            mask=w_mask[:, None] & n_mask[None, :], other=0,
-        )
-        # 8 codes/word fall in the same or adjacent 16-wide block -> one scale per word.
-        s_ptrs = scale_slot + offs_n[None, :] * stride_sn + (widx[:, None] // 2) * stride_sblk
-        s_mask = w_mask[:, None] & n_mask[None, :]
-        if e4m3_native_cx():
-            scale = tl.load(s_ptrs, mask=s_mask, other=0.0).to(tl.float32)
+    if SHARED_ROUTES:
+        # Unpaired routes avoid the second activation load and accumulation.
+        if partner_valid:
+            accumulator, result_partner = _decode_nvfp4_shared_project(
+                a_base, partner_base, packed_slot, scale_slot, lut_ptr, offs_n, n_mask,
+                N, K, stride_ak, stride_pn, stride_pkw, stride_sn, stride_sblk,
+                BLOCK_SIZE_N, BLOCK_SIZE_KW, ARITHMETIC_DEQUANT, True)
         else:
-            scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=s_mask, other=0))
-
-        kbase = 8 * widx
-        acc_w = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
-        for j in tl.static_range(8):
-            code = (word >> (4 * j)) & 0xF
-            if ARITHMETIC_DEQUANT:
-                b = _e2m1_arithmetic(code)
-            else:
-                b = tl.load(lut_ptr + code)
-            a_j = tl.load(a_base + (kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
-            acc_w += a_j[:, None] * b
-        partial += acc_w * scale
-
-    accumulator = tl.sum(partial, axis=0)
+            accumulator, result_partner = _decode_nvfp4_shared_project(
+                a_base, a_base, packed_slot, scale_slot, lut_ptr, offs_n, n_mask,
+                N, K, stride_ak, stride_pn, stride_pkw, stride_sn, stride_sblk,
+                BLOCK_SIZE_N, BLOCK_SIZE_KW, ARITHMETIC_DEQUANT, False)
+    else:
+        accumulator, result_partner = _decode_nvfp4_shared_project(
+            a_base, a_base, packed_slot, scale_slot, lut_ptr, offs_n, n_mask,
+            N, K, stride_ak, stride_pn, stride_pkw, stride_sn, stride_sblk,
+            BLOCK_SIZE_N, BLOCK_SIZE_KW, ARITHMETIC_DEQUANT, False)
     g = tl.load(global_ptr + slot * stride_ge + offs_n * stride_gn, mask=n_mask, other=0.0).to(tl.float32)
     accumulator = accumulator * g
 
@@ -236,6 +301,16 @@ def _decode_nvfp4_marlin_kernel(
 
     c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
     tl.store(c_ptrs, accumulator.to(compute_type), mask=(route_id < total_routes) & n_mask)
+
+    if SHARED_ROUTES:
+        result_partner = result_partner * g
+        if MUL_ROUTED_WEIGHT:
+            partner_weight = tl.load(topk_weights_ptr + partner // TOP_K * stride_tw_m
+                                     + partner % TOP_K * stride_tw_k, partner_valid, other=0.0)
+            result_partner *= partner_weight
+        partner_out = c_ptr + partner // TOP_K * stride_cm + partner % TOP_K * stride_ck
+        tl.store(partner_out + offs_n * stride_cn, result_partner.to(compute_type),
+                 mask=partner_valid & n_mask)
 
 
 @triton.jit

@@ -93,12 +93,15 @@ def reset_cache(cache) -> None:
         cache.lrfu_last.zero_()
 
 
-def prepare_lrfu(cache, layer_id, expert_ids):
+def prepare_lrfu(cache, layer_id, expert_ids, *, confirmed_rows=None):
+    confirmed = expert_ids.numel() if confirmed_rows is None else confirmed_rows * expert_ids.shape[-1]
     _prepare_lrfu_kernel[(1,)](
         expert_ids, cache.id_of_slot, cache.usage, cache.step,
         cache.lrfu_frequency, cache.lrfu_last, expert_ids.numel(), cache.cache_size,
         layer_id * cache.num_experts, cache.lrfu_half_life,
         cache.layer_distance_penalty, cache.num_experts, cache.num_layers,
+        cache.slot_for_id, cache.mtp_route_stats, confirmed, cache.mtp_spec_weight,
+        TRACE=cache.mtp_route_stats is not None,
         BK=triton.next_power_of_2(expert_ids.numel()),
         BC=triton.next_power_of_2(cache.cache_size), num_warps=8)
 
@@ -107,6 +110,8 @@ def prepare_lrfu(cache, layer_id, expert_ids):
 def _prepare_lrfu_kernel(query, owners, usage, clock, frequency, last,
                          K: tl.constexpr, C: tl.constexpr, base, half_life,
                          distance_penalty: tl.constexpr, E: tl.constexpr, L: tl.constexpr,
+                         slots, stats, CONFIRMED: tl.constexpr, SPEC_WEIGHT: tl.constexpr,
+                         TRACE: tl.constexpr,
                          BK: tl.constexpr, BC: tl.constexpr):
     k = tl.arange(0, BK)
     q = tl.load(query + k, k < K, other=0) + base
@@ -115,7 +120,19 @@ def _prepare_lrfu_kernel(query, owners, usage, clock, frequency, last,
     step = tl.load(clock) + 1
     previous = tl.load(last + q, first, other=0)
     old = tl.load(frequency + q, first, other=0)
-    value = old * tl.exp2(-(step - previous).to(tl.float32) / half_life) + 1.
+    credit = tl.full((BK,), 1., tl.float32)
+    if CONFIRMED < K:
+        strong = tl.sum(((q[:, None] == q[None, :]) & (k[None, :] < CONFIRMED)).to(tl.int32), 1) > 0
+        credit = tl.where(strong, 1., SPEC_WEIGHT)
+    else:
+        strong = tl.full((BK,), True, tl.int1)
+    if TRACE:
+        missing = tl.load(slots + q, first, other=0) < 0
+        tl.atomic_add(stats, tl.sum((first & strong).to(tl.int64), 0))
+        tl.atomic_add(stats + 1, tl.sum((first & ~strong).to(tl.int64), 0))
+        tl.atomic_add(stats + 2, tl.sum((first & strong & missing).to(tl.int64), 0))
+        tl.atomic_add(stats + 3, tl.sum((first & ~strong & missing).to(tl.int64), 0))
+    value = old * tl.exp2(-(step - previous).to(tl.float32) / half_life) + credit
     tl.store(frequency + q, value, first)
     tl.store(last + q, step, first)
     tl.debug_barrier()

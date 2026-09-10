@@ -170,6 +170,13 @@ class OffloadMoeCache:
             raise ValueError("FREETOKEN_EXPERT_LAYER_DISTANCE must be finite and between 0 and 16")
         if self.layer_distance_penalty and not self.lrfu_half_life:
             raise ValueError("FREETOKEN_EXPERT_LAYER_DISTANCE requires a positive LRFU half-life")
+        self.mtp_spec_weight = float(os.environ.get("FREETOKEN_MTP_EXPERT_SPEC_WEIGHT", "1"))
+        if not math.isfinite(self.mtp_spec_weight) or not 0 < self.mtp_spec_weight <= 1:
+            raise ValueError("FREETOKEN_MTP_EXPERT_SPEC_WEIGHT must be finite and in (0, 1]")
+        trace_mtp = os.environ.get("FREETOKEN_MTP_EXPERT_STATS", "0") == "1"
+        if (self.mtp_spec_weight < 1 or trace_mtp) and not self.lrfu_half_life:
+            raise ValueError("MTP expert policy requires a positive LRFU half-life")
+        self.mtp_route_stats = (torch.zeros(4, dtype=torch.int64, device=self.device) if trace_mtp else None)
         self.validate_rebuild(self.cache_size)
         self.lrfu_frequency = (torch.zeros(self.num_layers * self.num_experts,
                                           dtype=torch.float32, device=self.device)
@@ -841,12 +848,12 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor, *, confirmed_rows=None) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
         if self.lrfu_half_life:
             from freetoken.moe.offload_kernels import prepare_lrfu
-            prepare_lrfu(self, layer_id, expert_ids)
+            prepare_lrfu(self, layer_id, expert_ids, confirmed_rows=confirmed_rows)
 
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
@@ -894,6 +901,8 @@ class OffloadMoeCache:
         self.expert_recency.fill_(-1)
 
     def reset_stats(self) -> None:
+        if self.mtp_route_stats is not None:
+            self.mtp_route_stats.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self.lru_stats.zero_()

@@ -115,6 +115,7 @@ class Batch:
     phase: Literal["prefill", "decode"]
     use_decode_moe: bool = field(default=False, init=False)
     mtp_batched_linear: bool = field(default=False, init=False)
+    mtp_confirmed_rows: int | None = field(default=None, init=False)
     mtp_recurrent_history: torch.Tensor | None = field(default=None, init=False)
     mtp_state_indices: torch.Tensor | None = field(default=None, init=False)
     mtp_conv_inputs: torch.Tensor | None = field(default=None, init=False)

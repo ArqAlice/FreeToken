@@ -86,7 +86,7 @@ def test_prefetch_decode_fences_cache_access_and_joins_on_failure(monkeypatch, e
     monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: compute)
     routing = (torch.ones(1, 2), torch.tensor([[0, 1]], dtype=torch.int32))
     monkeypatch.setattr("freetoken.layers.moe.fused_topk", lambda **kw: routing)
-    monkeypatch.setattr(cache, "ensure_experts", lambda *a: calls.append("ensure"))
+    monkeypatch.setattr(cache, "ensure_experts", lambda *a, **kw: calls.append("ensure"))
     monkeypatch.setattr(cache, "copy_missing", lambda: calls.append("copy"))
 
     def run():
@@ -484,7 +484,8 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
         lambda *, hidden_states, gating_output, topk, renormalize: (topk_weights, topk_ids),
     )
 
-    def fake_ensure(layer_id, expert_ids):
+    def fake_ensure(layer_id, expert_ids, *, confirmed_rows=None):
+        assert confirmed_rows is None
         calls["ensure_layer_id"] = layer_id
         calls["ensure_expert_ids"] = expert_ids.clone()
         expert_ids.copy_(torch.tensor([[5, 0]], dtype=torch.int32))
@@ -1108,3 +1109,64 @@ def test_layer_distance_keeps_upcoming_layer_on_equal_frequency(monkeypatch):
     cache.ensure_experts(0, query)
     assert cache.id_of_slot.tolist() == [2, 0]
     assert cache.slot_for_id[2, 0].item() == -1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("weight", [1., .25])
+def test_speculative_lrfu_credits_shared_experts_once_and_preserves_routes(monkeypatch, weight):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setenv("FREETOKEN_EXPERT_LRFU_HALF_LIFE", "8")
+    monkeypatch.setenv("FREETOKEN_MTP_EXPERT_SPEC_WEIGHT", str(weight))
+    monkeypatch.setenv("FREETOKEN_MTP_EXPERT_STATS", "1")
+    cache = OffloadMoeCache(1, 8, 8, torch.device("cuda"))
+    raw = torch.tensor([[0, 1], [1, 2], [2, 3]], device="cuda", dtype=torch.int32)
+    query = raw.clone()
+    cache.ensure_experts(0, query, confirmed_rows=1)
+    torch.testing.assert_close(cache.lrfu_frequency[:4].cpu(), torch.tensor([1., 1., weight, weight]))
+    assert torch.equal(cache.id_of_slot[query.long()], raw)
+    assert cache.mtp_route_stats.tolist() == [2, 2, 2, 2]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        query.copy_(raw)
+        cache.ensure_experts(0, query, confirmed_rows=1)
+    graph.replay()
+    assert torch.equal(cache.id_of_slot[query.long()], raw)
+    assert cache.mtp_route_stats.tolist() == [4, 4, 2, 2]
+    cache.reset_stats()
+    assert not cache.mtp_route_stats.count_nonzero()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("weight,retained", [(1., 1), (.25, 0)])
+def test_speculative_lrfu_retains_confirmed_expert_under_pressure(monkeypatch, weight, retained):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    monkeypatch.setenv("FREETOKEN_EXPERT_LRFU_HALF_LIFE", "256")
+    monkeypatch.setenv("FREETOKEN_MTP_EXPERT_SPEC_WEIGHT", str(weight))
+    cache = OffloadMoeCache(2, 2, 3, torch.device("cuda"))
+    for layer, ids, confirmed in [(0, [[0]], 1), (0, [[1]], 0), (1, [[0], [1]], 1)]:
+        query = torch.tensor(ids, dtype=torch.int32, device="cuda")
+        raw = query.clone()
+        cache.ensure_experts(layer, query, confirmed_rows=confirmed)
+        assert torch.equal(cache.id_of_slot[query.long()], raw + layer * 2)
+    assert cache.slot_for_id[0, retained] >= 0
+    assert cache.slot_for_id[0, 1-retained] == -1
+
+
+@pytest.mark.parametrize("weight", ["0", "-1", "1.1", "nan", "inf"])
+def test_speculative_lrfu_rejects_invalid_weight(monkeypatch, weight):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    monkeypatch.setenv("FREETOKEN_EXPERT_LRFU_HALF_LIFE", "256")
+    monkeypatch.setenv("FREETOKEN_MTP_EXPERT_SPEC_WEIGHT", weight)
+    with pytest.raises(ValueError, match="SPEC_WEIGHT"):
+        OffloadMoeCache(1, 8, 8, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("option", ["FREETOKEN_MTP_EXPERT_SPEC_WEIGHT", "FREETOKEN_MTP_EXPERT_STATS"])
+def test_speculative_expert_policy_requires_lrfu(monkeypatch, option):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    monkeypatch.setenv("FREETOKEN_EXPERT_LRFU_HALF_LIFE", "0")
+    monkeypatch.setenv(option, ".25" if option.endswith("WEIGHT") else "1")
+    with pytest.raises(ValueError, match="positive LRFU half-life"):
+        OffloadMoeCache(1, 8, 8, torch.device("cpu"))

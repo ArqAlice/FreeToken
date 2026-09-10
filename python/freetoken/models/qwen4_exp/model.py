@@ -16,6 +16,7 @@ immediate combine::
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -215,6 +216,42 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
             mark(self.model)
 
+    def load_state_dict(self, state_dict, *, prefix="", _internal=False):
+        super().load_state_dict(state_dict, prefix=prefix, _internal=_internal)
+        # Convert after checkpoint materialization, before the engine budgets VRAM.
+        self._requantize_gdn_inputs()
+        self._draft_lm_head = None
+        if self.mtp is not None and os.environ.get("FREETOKEN_MTP_DRAFT_FP8_HEAD", "0") == "1":
+            from freetoken.layers.embedding import DraftFP8LMHead
+            from freetoken.utils import init_logger
+
+            if not isinstance(self.lm_head, ParallelLMHead):
+                raise ValueError("Draft FP8 LM head requires an unquantized target LM head")
+            self._draft_lm_head = DraftFP8LMHead(self.lm_head)
+            init_logger(__name__).info_rank0(
+                f"Draft FP8 LM head: added {self._draft_lm_head._weight_bytes} resident weight bytes")
+
+    def _requantize_gdn_inputs(self):
+        self._gdn_fp8_saved_bytes = 0
+        if os.environ.get("FREETOKEN_GDN_FP8_INPUT", "0") != "1":
+            return
+        from freetoken.layers.gdn_fp8 import GDNFP8Input
+        from freetoken.utils import init_logger
+
+        for layer in self.model.layers.op_list:
+            gdn = layer.linear_attn if hasattr(layer, 'linear_attn') else None
+            if gdn is None or not hasattr(gdn, 'in_proj'):
+                continue
+            if isinstance(gdn.in_proj, GDNFP8Input):
+                self._gdn_fp8_saved_bytes += gdn.in_proj._saved_bytes
+                continue
+            old = gdn.in_proj
+            gates = 2 * gdn.num_v_heads * old.local_output_size // old.full_output_size
+            gdn.in_proj = GDNFP8Input(old.weight, gates)
+            self._gdn_fp8_saved_bytes += gdn.in_proj._saved_bytes
+        init_logger(__name__).info_rank0(
+            f"GDN FP8 input: released {self._gdn_fp8_saved_bytes} resident weight bytes; b/a gates stay BF16")
+
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
         ple_layers = self.model.ple_layers
@@ -301,7 +338,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         embedding = self.model.embed_tokens.forward(input_ids)
         output, residual = self.mtp.forward(embedding, target_residual, batch, return_residual=True,
                                            compute_output=compute_logits)
-        logits = self.lm_head.forward(output) if compute_logits else None
+        logits = None
+        if compute_logits:
+            head = getattr(self, "_draft_lm_head", None) or self.lm_head
+            logits = head.forward(output)
         return (logits, residual) if return_residual else logits
 
 

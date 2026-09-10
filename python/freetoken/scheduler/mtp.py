@@ -34,9 +34,20 @@ class MTPRunner:
         self.auto_stats = {}
         self._target_graphs = {}
         self._draft_graphs = {}
+        self._probability_graphs = {}
         self._sampling_args = {}
+        self._batch_buffers = {}
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        self._speculative_cache = (getattr(cache, "mtp_spec_weight", 1) < 1
+                                   or getattr(cache, "mtp_route_stats", None) is not None)
         self._greedy_draft = os.environ.get("FREETOKEN_MTP_GREEDY_DRAFT", "0") == "1"
+        self._draft_min_prob = float(os.environ.get("FREETOKEN_MTP_DRAFT_MIN_PROB", "0"))
+        if not 0 <= self._draft_min_prob <= 1:
+            raise ValueError("FREETOKEN_MTP_DRAFT_MIN_PROB must be between 0 and 1")
+        self.draft_stop_checks = 0
+        self.draft_stops = 0
         self._verify_history = None
+        self._acceptance_transfer = None
         max_drafts = getattr(getattr(scheduler, "config", None), "mtp_speculative_tokens", 4)
         self._history_steps = min(5, max(2, max_drafts + 1))
         config = getattr(getattr(self.engine, "config", None), "model_config", None)
@@ -116,14 +127,14 @@ class MTPRunner:
             inputs = self.scheduler._prepare_batch(batch, allocate=False)
             return self._normal(inputs).next_tokens_gpu
         depth, bucket = policy.depth, policy.bucket
-        graphs = len(self._target_graphs), len(self._draft_graphs)
+        graphs = len(self._target_graphs), len(self._draft_graphs), len(self._probability_graphs)
         begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         begin.record(self.engine.stream)
         started = time.perf_counter()
         tokens = self._one(req, phase)
         host = time.perf_counter() - started
         end.record(self.engine.stream)
-        captured = graphs != (len(self._target_graphs), len(self._draft_graphs))
+        captured = graphs != (len(self._target_graphs), len(self._draft_graphs), len(self._probability_graphs))
         self._timings.append((req.uid, bucket, depth, tokens.numel(), host, captured,
                               begin, None, end))
         return tokens
@@ -133,7 +144,10 @@ class MTPRunner:
         self._policies.clear()
         self._target_graphs.clear()
         self._draft_graphs.clear()
+        self._probability_graphs.clear()
+        self._batch_buffers.clear()
         self._verify_history = None
+        self._acceptance_transfer = None
         self._qsa_blocks.clear()
         self._qsa_owner = None
 
@@ -176,9 +190,30 @@ class MTPRunner:
                                    else input_ids.to("cpu"))
         # Tiny verification batches need routed experts only, not a full layer transfer.
         batch.use_decode_moe = start > 0 and input_ids.numel() <= 5
-        self.scheduler._prepare_batch(batch, allocate=False, sample=False)
+        if not self._prepare_small_batch(batch):
+            self.scheduler._prepare_batch(batch, allocate=False, sample=False)
         batch.input_ids = input_ids
         return batch
+
+    def _prepare_small_batch(self, batch):
+        if os.environ.get("FREETOKEN_MTP_FAST_PREPARE", "0") != "1" or not batch.use_decode_moe:
+            return False
+        from freetoken.attention.qsa_sparse import QSASparseAttnBackend
+
+        backend = getattr(self.engine, "attn_backend", None)
+        backend = getattr(backend, "prefill_backend", backend)
+        if not isinstance(backend, QSASparseAttnBackend):
+            return False
+        cm = self.scheduler.cache_manager
+        if (cm.is_hybrid or getattr(cm, "swa_paged", False)
+                or self.engine.linear_state_pool is None
+                or getattr(batch.reqs[0], "mm_embeds", None) is not None):
+            return False
+        from .mtp_batch import prepare_small_batch
+
+        prepare_small_batch(batch, self.engine.page_table, backend, self._batch_buffers)
+        self.scheduler._forward_iter += 1
+        return True
 
     def _target(self, batch, *, all_tokens=False, compute_logits=True):
         if (batch.is_prefill and batch.use_decode_moe and 1 <= batch.input_ids.numel() <= 5
@@ -199,7 +234,7 @@ class MTPRunner:
         key = (batch.input_ids.numel(), all_tokens, compute_logits,
                table.shape[1] if table is not None else 0,
                getattr(batch, "mtp_recurrent_history", None) is not None,
-               getattr(batch, "mtp_batched_linear", False))
+               getattr(batch, "mtp_batched_linear", False), getattr(batch, "mtp_confirmed_rows", None))
         first_replay = key not in self._target_graphs
         if first_replay:
             # Warm kernels on the live slot, then undo recurrent writes before replay.
@@ -286,6 +321,9 @@ class MTPRunner:
             batch = copy(batch)
             for name in ("mtp_recurrent_history", "mtp_state_indices", "mtp_conv_inputs", "mtp_ple_inputs"):
                 setattr(batch, name, None)
+        if getattr(batch, "mtp_confirmed_rows", None) is not None:
+            batch = copy(batch)
+            batch.mtp_confirmed_rows = None
         proposal = next_token is not None
         if proposal and self._auto_enabled():
             policy = self._policy(req)
@@ -304,8 +342,7 @@ class MTPRunner:
             if req.sampling_params.is_greedy or self._greedy_draft:
                 self.drafts[req.uid] = logits[-1].argmax().to(torch.int32).reshape(1)
             else:
-                args = self._sample_args(batch)
-                probs = self.engine.sampler.probabilities(logits[-1:], args)
+                probs = self._draft_probabilities(logits[-1:], batch)
                 self.draft_probs[req.uid] = probs
                 self.drafts[req.uid] = self.engine.sampler.sample_probs(probs).to(torch.int32)
 
@@ -314,18 +351,50 @@ class MTPRunner:
         distributions = [probs] if probs is not None else []
         hidden = self.draft_states.pop(req.uid, None)
         for i in range(1, count):
+            if self._draft_min_prob > 0 and distributions:
+                self.draft_stop_checks += 1
+                if distributions[-1].max().item() < self._draft_min_prob:
+                    # Keep the sampled prefix; only cancel candidates not generated yet.
+                    self.draft_stops += 1
+                    break
             position = req.cached_len + i - 1
             batch = self._batch(req, position, position + 1, tokens[-1], host_input=False)
+            if self._speculative_cache:
+                batch.mtp_confirmed_rows = 0
             logits, hidden = self._head(tokens[-1], hidden, batch, reuse_qsa=True)
             if req.sampling_params.is_greedy or self._greedy_draft:
                 token = logits[-1].argmax().to(torch.int32).reshape(1)
             else:
-                args = self._sample_args(batch)
-                distribution = self.engine.sampler.probabilities(logits[-1:], args)
+                distribution = self._draft_probabilities(logits[-1:], batch)
                 distributions.append(distribution)
                 token = self.engine.sampler.sample_probs(distribution).to(torch.int32)
             tokens.append(token)
         return torch.cat(tokens), torch.cat(distributions) if distributions else None
+
+    def _draft_probabilities(self, logits, batch):
+        args = self._sample_args(batch)
+        if (not logits.is_cuda or os.environ.get("FREETOKEN_MTP_DRAFT_PROBS_GRAPH", "0") != "1"):
+            return self.engine.sampler.probabilities(logits, args)
+        params = batch.reqs[0].sampling_params
+        key = (logits.shape, logits.dtype, params.temperature, params.top_k, params.top_p)
+        if key not in self._probability_graphs:
+            if len(self._probability_graphs) >= 16:
+                return self.engine.sampler.probabilities(logits, args)
+            from freetoken.engine.sample import BatchSamplingArgs
+
+            static = logits.clone()
+            held = BatchSamplingArgs(*(x.clone() if x is not None else None
+                                       for x in (args.temperatures, args.top_k, args.top_p)))
+            self.engine.sampler.probabilities(static, held)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = self.engine.sampler.probabilities(static, held)
+            self._probability_graphs[key] = (graph, static, held, output)
+        graph, static, held, output = self._probability_graphs[key]
+        static.copy_(logits)
+        graph.replay()
+        # Draft distributions must survive later proposals replaying this graph.
+        return output.clone()
 
     def _qsa_head_batch(self, ids, batch, compute_logits, reuse_qsa):
         count = getattr(getattr(self.scheduler, "config", None), "mtp_speculative_tokens", 1)
@@ -373,7 +442,8 @@ class MTPRunner:
         table = batch.attn_metadata.block_table
         key = (ids.numel(), compute_logits, table.shape[1] if table is not None else 0,
                getattr(batch, "mtp_batched_linear", False),
-               bool(getattr(batch, "mtp_qsa_blocks", None)), getattr(batch, "mtp_qsa_reuse", False))
+               bool(getattr(batch, "mtp_qsa_blocks", None)), getattr(batch, "mtp_qsa_reuse", False),
+               getattr(batch, "mtp_confirmed_rows", None))
         if key not in self._draft_graphs:
             saved = self._snapshot(batch.reqs[0])
             with self.engine.ctx.forward_batch(batch):
@@ -477,6 +547,21 @@ class MTPRunner:
         old_ring.index_copy_(1, positions, ring.index_select(1, positions))
         ring.copy_(old_ring)
 
+    def _stage_acceptance(self, accepted):
+        if self._acceptance_transfer is None:
+            self._acceptance_transfer = (torch.empty((), dtype=torch.int64, device="cpu", pin_memory=True),
+                                         torch.cuda.Event())
+        host, ready = self._acceptance_transfer
+        host.copy_(accepted, non_blocking=True)
+        ready.record()
+        return host, ready
+
+    def _commit_prefix_device(self, req, saved, batch, accepted):
+        from freetoken.kernel.triton.mtp_state import commit_prefix_cuda
+
+        commit_prefix_cuda(self.engine.linear_state_pool, saved, batch,
+                           self.engine.kv_cache._pending_ring[req.table_idx], accepted, req.cached_len)
+
     def _one(self, req, phase):
         start, end = req.cached_len, req.device_len
         ids = self.scheduler.token_pool[req.table_idx, start:end].clone()
@@ -512,17 +597,23 @@ class MTPRunner:
         allocation = copy(req)
         allocation.cached_len, allocation.device_len = end, end + count
         self.scheduler.cache_manager.allocate_paged([allocation])
+        allocated_end = div_ceil(end + count, ps) * ps
         compact = (self._draft_state_isolated
                    and self._history_supported(ids.numel() + count, start > 0))
         # Draft QSA does not touch target GDN/PLE; history supplies the committed recurrence.
         saved = self._snapshot(req, recurrent=not compact)
         if count > 1:
             draft, draft_probs = self._lookahead(req, draft, draft_probs, count)
+            count = draft.numel()
             self._restore(req, saved, ring_only=self._draft_state_isolated)
         verify_ids = torch.cat((ids, draft))
         batch = self._batch(req, start, end + count, verify_ids)
+        if self._speculative_cache:
+            batch.mtp_confirmed_rows = ids.numel()
         tracked = self._track_verification(batch)
         logits, residual = self._target(batch, all_tokens=True)
+        device_commit = (tracked and logits.is_cuda
+                         and os.environ.get("FREETOKEN_MTP_FUSED_COMMIT", "0") == "1")
         if greedy or self._greedy_draft:
             if greedy:
                 verified = logits.argmax(dim=-1).to(torch.int32)
@@ -532,21 +623,35 @@ class MTPRunner:
                 verified = self.engine.sampler.sample_probs(probs).to(torch.int32)
             # With deterministic proposals, a target draw both verifies and supplies
             # the correction; samples after the first mismatch are discarded.
-            accepted = int(matching_prefix(verified, draft).item())
-            last = verified[accepted:accepted + 1]
+            accepted_gpu = matching_prefix(verified, draft)
+            if device_commit:
+                host, ready = self._stage_acceptance(accepted_gpu)
+                last = verified.gather(0, accepted_gpu.reshape(1))
+            else:
+                accepted = int(accepted_gpu.item())
+                last = verified[accepted:accepted + 1]
         else:
             args = self._sample_args(batch)
             probs = self.engine.sampler.probabilities(logits, args)
             accepted_gpu = acceptance_prefix(probs[:-1], draft_probs, draft)
+            if device_commit:
+                host, ready = self._stage_acceptance(accepted_gpu)
             last = self.engine.sampler.sample_speculative(probs, draft_probs, accepted_gpu).to(torch.int32)
-            accepted = int(accepted_gpu.item())
+            if not device_commit:
+                accepted = int(accepted_gpu.item())
+        if device_commit:
+            self._commit_prefix_device(req, saved, batch, accepted_gpu)
+            # Read only after the scalar copy; sampling and state commits can keep running.
+            ready.synchronize()
+            accepted = int(host.item())
         tokens = torch.cat((draft[:accepted], last))
         self.proposed += count
         self.accepted += accepted
         self.acceptance_lengths[accepted] = self.acceptance_lengths.get(accepted, 0) + 1
         if accepted < count:
             if tracked:
-                self._commit_prefix(req, saved, batch, accepted + 1)
+                if not device_commit:
+                    self._commit_prefix(req, saved, batch, accepted + 1)
                 residual = residual[:accepted + 1]
             else:
                 self._restore(req, saved)
@@ -554,12 +659,10 @@ class MTPRunner:
             batch = self._batch(req, start, end + accepted, verify_ids)
             if not tracked:
                 _, residual = self._target(batch, compute_logits=False)
-            ps = self.scheduler.config.page_size
-            first_unused = div_ceil(end + accepted, ps) * ps
-            allocated_end = div_ceil(end + count, ps) * ps
-            if allocated_end > first_unused:
-                cm = self.scheduler.cache_manager
-                cm._free(cm.page_table[req.table_idx, first_unused:allocated_end].clone())
+        first_unused = div_ceil(end + accepted, ps) * ps
+        if allocated_end > first_unused:
+            cm = self.scheduler.cache_manager
+            cm._free(cm.page_table[req.table_idx, first_unused:allocated_end].clone())
         req.cached_len, req.device_len = end + accepted, end + accepted + 1
         self.scheduler.token_pool[req.table_idx, end:end + tokens.numel()] = tokens
         self._draft(req, start, residual, verify_ids, tokens[-1], batch)
@@ -591,7 +694,7 @@ class MTPRunner:
         batch = forward_input.batch
         policies = [self._policy(r) for r in batch.reqs]
         batch.mtp_return_residual = any(not p.stopped for p in policies)
-        graphs = len(self._draft_graphs)
+        graphs = len(self._draft_graphs), len(self._probability_graphs)
         begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         begin.record(self.engine.stream)
         before = time.perf_counter()
@@ -605,7 +708,7 @@ class MTPRunner:
                             batch.input_ids[i:i + 1], result.next_tokens_gpu[i])
         self.engine.mtp_target_residual = None
         end.record(self.engine.stream)
-        captured = graphs != len(self._draft_graphs)
+        captured = graphs != (len(self._draft_graphs), len(self._probability_graphs))
         # Amortize the ordinary batched decode cost across its emitted tokens.
         subjects = [(r.uid, p.bucket) for r, p in zip(batch.reqs, policies) if not p.stopped]
         self._timings.append((subjects, None, 0 if subjects else "stopped",

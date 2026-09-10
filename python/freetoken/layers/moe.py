@@ -282,7 +282,8 @@ class OffloadMoELayer(MoELayer):
         transfer.wait_stream(compute)
         try:
             with torch.cuda.stream(transfer):
-                cache.ensure_experts(self.layer_id, routing[1])
+                cache.ensure_experts(self.layer_id, routing[1],
+                                     confirmed_rows=getattr(batch, "mtp_confirmed_rows", None))
                 cache.copy_missing()
             yield routing
         finally:
@@ -338,7 +339,10 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)
+        confirmed = None
+        if cache.mtp_spec_weight < 1 or cache.mtp_route_stats is not None:
+            confirmed = getattr(get_global_ctx().batch, "mtp_confirmed_rows", None)
+        cache.ensure_experts(self.layer_id, topk_ids, confirmed_rows=confirmed)
         cache.copy_missing()
         return self._decode_cached(cache, hidden_states, topk_weights, topk_ids)
 
