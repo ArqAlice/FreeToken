@@ -44,6 +44,7 @@ class Qwen4ExpArgs:
     # decoder geometry but own independent QSA KV and routed-expert state.
     mtp_num_hidden_layers: int = 0
     mtp_dense_quant: str = "none"
+    mtp_bf16_experts: bool = False
 
     @property
     def index_topk_blocks(self) -> int:
@@ -154,6 +155,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
     mtp_dense_quant = "none"
+    mtp_bf16_experts = False
     get = _quant_get(hf_config)
     if get is None:
         expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
@@ -182,6 +184,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
             expert_quant = _quant(f"{prefix}.mlp.experts.0.gate_proj")
             dense_quant = _quant(f"{prefix}.mlp.shared_expert.gate_proj")
             mtp_dense_quant = _quant("mtp.layers.0.mlp.shared_expert.gate_proj")
+            mtp_bf16_experts = is_fp4 and _ignored(ignore, "mtp.layers.0.mlp.experts.0.gate_proj")
             attn_quant = _quant(f"{prefix}.self_attn.q_proj")
             lm_head_quant = _quant("lm_head")
 
@@ -271,6 +274,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         index_ratio=int(text.indexer_compress_ratio),
         mtp_num_hidden_layers=mtp_layers,
         mtp_dense_quant=mtp_dense_quant,
+        mtp_bf16_experts=mtp_bf16_experts,
     )
 
     return ModelConfig(

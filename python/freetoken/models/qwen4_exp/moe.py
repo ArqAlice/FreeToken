@@ -9,6 +9,7 @@ import torch
 from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add, shared_gate_sigmoid
 from freetoken.layers.moe import OffloadMoELayer, make_moe_layer
 from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
+from freetoken.moe.fused import fused_topk
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -22,6 +23,8 @@ class Qwen4ExpMoE(Qwen3_5MoE):
 
     def __init__(self, config: ModelConfig, layer_id: int | None = None) -> None:
         self._mtp_expert_overlap = os.environ.get("FREETOKEN_MTP_EXPERT_OVERLAP", "1") == "1"
+        self._resident_mtp = (getattr(config.qwen4_args, "mtp_bf16_experts", False)
+                              and layer_id is not None and layer_id >= config.num_layers)
         if getattr(config, "expert_quant", "none") != "fp8_block":
             super().__init__(config, layer_id=layer_id)
             return
@@ -46,8 +49,14 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         with pending as routing:
             shared = self.shared_expert.forward(hidden_states)
             gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
-        routed = (self.experts.forward_prefetched(hidden_states, routing) if routing is not None else
-                  self.experts.forward(hidden_states=hidden_states, router_logits=router_logits))
+        if self._resident_mtp:
+            # The global backend remains NVFP4 offload; this head owns BF16 resident weights.
+            weights, ids = fused_topk(hidden_states, router_logits, self.experts.top_k,
+                                     self.experts.renormalize)
+            routed = self.experts.routed_forward(hidden_states, weights, ids)
+        else:
+            routed = (self.experts.forward_prefetched(hidden_states, routing) if routing is not None else
+                      self.experts.forward(hidden_states=hidden_states, router_logits=router_logits))
         return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
 
 

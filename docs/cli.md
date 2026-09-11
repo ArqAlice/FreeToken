@@ -118,7 +118,21 @@ MTP uses the checkpoint's prediction head to propose tokens and verifies them
 with the main model. It supports greedy generation and sampling with temperature,
 top-k and top-p. This implementation requires a Qwen4-family checkpoint with
 exactly one MTP layer and one GPU (TP=1). The tested checkpoint is
-`aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP`.
+`aday777/Qwen3.8-Flash-Next-Uncensored-NVFP4-MTP`. The loader also supports
+`RadixArk/Qwen3.8-Flash-Next-NVFP4`, whose MTP experts remain BF16:
+
+```bash
+ft serve --model RadixArk/Qwen3.8-Flash-Next-NVFP4 \
+  --mtp-speculative-tokens 1
+```
+
+For the RadixArk checkpoint, the 48 main-model expert layers use NVFP4 offload;
+the MTP head's BF16 experts stay resident on the GPU without requantization.
+Those expert weights occupy about 4.69 GiB and are included in resident-weight
+memory budgeting before automatic expert-cache sizing. They do not use slots in
+the main model's NVFP4 cache. This reduces the VRAM available for that cache;
+allow for it when setting fixed cache sizes. The head remains loaded even with
+`--mtp-speculative-tokens 0`. No extra MTP weight-format argument is needed.
 
 | Flag | Default | Meaning |
 |---|---|---|

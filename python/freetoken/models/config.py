@@ -359,8 +359,12 @@ class ModelConfig:
 
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
+        Resident BF16 Qwen4 MTP experts are excluded from the shared offload geometry.
         """
         mtp_layers = int(getattr(self.qwen4_args, "mtp_num_hidden_layers", 0) or 0)
+        # Mixed-format Qwen4 heads keep BF16 experts resident outside the NVFP4 cache.
+        if getattr(self.qwen4_args, "mtp_bf16_experts", False):
+            mtp_layers = 0
         return self.num_layers - self.first_k_dense_replace + mtp_layers
 
     @property

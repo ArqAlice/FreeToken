@@ -29,6 +29,29 @@ def _config(num_layers: int = 4) -> ModelConfig:
     return parse_config(toy_hf_config(num_layers))
 
 
+@pytest.mark.parametrize("bf16_head", [False, True])
+def test_mtp_expert_storage_is_independent_of_target(bf16_head, monkeypatch):
+    from dataclasses import replace
+    from freetoken.layers.moe import MoELayer, OffloadMoELayer
+    from freetoken.models.qwen4_exp.model import Qwen4ExpMTP
+
+    hf = toy_hf_config()
+    hf.text_config.mtp = {"num_hidden_layers": 1}
+    config = parse_config(hf)
+    args = replace(config.qwen4_args, mtp_bf16_experts=bf16_head)
+    config = replace(config, qwen4_args=args, moe_backend="offload", expert_quant="nvfp4")
+    # Storage-only construction must not cache CPU rotary tables for later GPU tests.
+    monkeypatch.setattr("freetoken.models.qwen4_exp.attention.get_rope", lambda *a, **kw: None)
+    with torch.device("cpu"):
+        head = Qwen4ExpMTP(config)
+    experts = head.layers.op_list[0].mlp.experts
+    assert type(experts) is (MoELayer if bf16_head else OffloadMoELayer)
+    assert config.moe_backend == "offload"
+    assert config.expert_quant == "nvfp4"
+    assert config.num_moe_layers == config.num_layers + (not bf16_head)
+    assert ("layers.0.mlp.experts.gate_up_proj" in head.state_dict()) == bf16_head
+
+
 def test_target_residual_without_output_skips_final_mixer():
     from freetoken.models.qwen4_exp.model import Qwen4ExpModel
 
@@ -38,6 +61,32 @@ def test_target_residual_without_output_skips_final_mixer():
                                            return_residual=True, compute_output=False)
     assert output is None
     torch.testing.assert_close(residual, torch.tensor([[1., 1.], [2., 2.]]))
+
+
+def test_resident_mtp_bypasses_global_offload_dispatch(monkeypatch):
+    from freetoken.models.qwen4_exp.moe import Qwen4ExpMoE
+
+    def unexpected(**kwargs):
+        raise AssertionError("resident MTP must not use the global offload backend")
+
+    ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    weights = torch.tensor([[0.25, 0.75]])
+    def routed(x, w, i):
+        assert w is weights and i is ids
+        return x * 2
+
+    model = SimpleNamespace(_mtp_expert_overlap=True, _resident_mtp=True,
+        experts=SimpleNamespace(top_k=2, renormalize=True, forward=unexpected,
+                                routed_forward=routed),
+        gate=SimpleNamespace(forward=lambda x: x),
+        shared_expert=SimpleNamespace(forward=lambda x: x + 1),
+        shared_expert_gate=SimpleNamespace(weight=torch.ones(1, 4)))
+    monkeypatch.setattr("freetoken.models.qwen4_exp.moe.fused_topk", lambda *a: (weights, ids))
+    monkeypatch.setattr("freetoken.models.qwen4_exp.moe.shared_gate_sigmoid", lambda x, w: x.sum(1))
+    monkeypatch.setattr("freetoken.models.qwen4_exp.moe.shared_gate_mul_add",
+                        lambda r, s, g: r + s * g[:, None])
+    x = torch.arange(4).reshape(1, 4).float()
+    torch.testing.assert_close(Qwen4ExpMoE.forward(model, x), x * 2 + (x + 1) * x.sum())
 
 
 def test_residual_only_forwards_skip_lm_head(monkeypatch):
@@ -474,7 +523,7 @@ def test_shared_expert_reads_finish_before_prefetched_routed_write(monkeypatch, 
     experts.prefetch_decode = prefetch
     experts.forward_prefetched = routed
     experts.forward = routed
-    model = SimpleNamespace(_mtp_expert_overlap=overlap, experts=experts,
+    model = SimpleNamespace(_mtp_expert_overlap=overlap, _resident_mtp=False, experts=experts,
         gate=SimpleNamespace(forward=lambda x: x.clone()),
         shared_expert=SimpleNamespace(forward=lambda x: x + 1),
         shared_expert_gate=SimpleNamespace(weight=torch.ones(1, 4)))

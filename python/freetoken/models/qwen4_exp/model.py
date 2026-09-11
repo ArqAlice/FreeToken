@@ -151,6 +151,8 @@ class Qwen4ExpMTP(BaseOP):
         self.fc_hidden = LinearReplicated(self.hidden_size, self.hidden_size, has_bias=False)
         first_layer = config.num_layers
         mtp_config = replace(config, dense_quant=args.mtp_dense_quant)
+        if args.mtp_bf16_experts:
+            mtp_config = replace(mtp_config, expert_quant="none", moe_backend="fused")
         self.layers = OPList(
             [
                 Qwen4ExpDecoderLayer(mtp_config, first_layer + i)

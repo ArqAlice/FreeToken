@@ -37,6 +37,55 @@ def test_mtp_scale_fusion_uses_checkpoint_rows():
     assert value.tolist() == [2.] * 7 + [3.] * 7
     assert not pending
 
+
+@pytest.mark.parametrize("include_experts", [False, True])
+def test_complete_bf16_mtp_loads_resident_experts(tmp_path, include_experts):
+    from freetoken.layers.moe import MoELayer
+
+    prefix = "mtp.layers.0.mlp.experts."
+    weights = {
+        "mtp.fc_embedding.weight": _bf16(H, H),
+        prefix + "gate_up_proj": _bf16(E, 2 * I, H),
+        prefix + "down_proj": _bf16(E, H, I),
+    }
+    save_file(weights, str(tmp_path / "model.safetensors"))
+    loaded = dict(iter_weights(str(tmp_path), torch.device("cpu"),
+                               include_moe_experts=include_experts, include_non_moe=True))
+    for key, value in weights.items():
+        assert torch.equal(loaded[key], value)
+    with torch.device("meta"):
+        experts = MoELayer(E, 2, H, I)
+    # Match the engine's BF16 allocation without materializing a second weight copy.
+    experts.gate_up_proj = experts.gate_up_proj.to(torch.bfloat16)
+    experts.down_proj = experts.down_proj.to(torch.bfloat16)
+    experts.load_state_dict({key: loaded[key] for key in weights if key.startswith(prefix)},
+                            prefix=prefix[:-1])
+    assert torch.equal(experts.gate_up_proj, weights[prefix + "gate_up_proj"])
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("bf16_head", [False, True])
+def test_mtp_source_banks_exclude_resident_head(monkeypatch, parallel, bf16_head):
+    from freetoken.models.qwen4_exp import weight
+    from freetoken.models import nvfp4_banks
+
+    calls = []
+    def banks(path, config, spec, **kwargs):
+        calls.append(config.num_moe_layers)
+        return {"weights": [object()] * config.num_moe_layers}
+
+    monkeypatch.setattr(weight, "load_nvfp4_expert_source_banks", banks)
+    monkeypatch.setattr(nvfp4_banks, "load_nvfp4_expert_source_banks_parallel", banks)
+    cfg = SimpleNamespace(num_layers=2, first_k_dense_replace=0, num_experts=E,
+                          hidden_size=H, moe_intermediate_size=I,
+                          qwen4_args=SimpleNamespace(mtp_num_hidden_layers=1,
+                                                     mtp_bf16_experts=bf16_head))
+    loader = (weight.load_nvfp4_expert_sources_parallel if parallel
+              else weight.load_nvfp4_expert_sources)
+    result = loader("unused", cfg)
+    assert calls == ([2] if bf16_head else [2, 1])
+    assert len(result["weights"]) == (2 if bf16_head else 3)
+
 H = 32  # hidden_size
 HC = 4  # hc_count
 LR = 320  # hc_lowrank; kept real so the merged HC pad is the real (-(320+4)) % 16 = 12

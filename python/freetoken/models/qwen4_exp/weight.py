@@ -6,8 +6,8 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``model.visual.*`` (served text-only). Routed MTP experts go to a separate
-offload source bank; the remaining MTP head tensors load with the dense state dict.
+Dropped: ``model.visual.*`` (served text-only). NVFP4 MTP experts use offload banks;
+stacked BF16 MTP experts remain resident and load with the dense state dict.
 """
 
 from __future__ import annotations
@@ -115,6 +115,8 @@ def _rename(raw_name: str) -> str | None:
     if raw_name.startswith(("model.visual.", "visual.")):
         return None
     if raw_name.startswith("mtp.layers") and ".mlp.experts." in raw_name:
+        if re.fullmatch(r"mtp\.layers\.\d+\.mlp\.experts\.(gate_up_proj|down_proj)", raw_name):
+            return raw_name
         return None
     if raw_name.startswith("mtp."):
         return None if raw_name.endswith(".input_scale") else raw_name
@@ -206,8 +208,8 @@ def iter_weights(
     gate|up -> ``gate_up_proj``, and each per-layer HC's ``input_mix_weight_down`` |
     ``block_inject_weight`` -> a zero-padded ``input_mix_weight_down_block_inject``.
 
-    ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
-    routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
+    ``include_moe_experts`` controls neither NVFP4 banks nor resident BF16 MTP weights:
+    NVFP4 experts load separately, while stacked BF16 MTP experts always load here.
     """
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
@@ -398,7 +400,7 @@ def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> di
         primary=get_tp_info().is_primary(), layer_sink=layer_sink,
     )
     mtp_layers = int(getattr(config.qwen4_args, "mtp_num_hidden_layers", 0) or 0)
-    if not mtp_layers:
+    if not mtp_layers or getattr(config.qwen4_args, "mtp_bf16_experts", False):
         return sources
     mtp = SimpleNamespace(
         num_moe_layers=mtp_layers,
@@ -430,7 +432,7 @@ def load_nvfp4_expert_sources_parallel(
         primary=get_tp_info().is_primary(), workers=workers, chunk=chunk, layer_sink=layer_sink,
     )
     mtp_layers = int(getattr(config.qwen4_args, "mtp_num_hidden_layers", 0) or 0)
-    if not mtp_layers:
+    if not mtp_layers or getattr(config.qwen4_args, "mtp_bf16_experts", False):
         return sources
     mtp = SimpleNamespace(
         num_moe_layers=mtp_layers, num_experts=config.num_experts,

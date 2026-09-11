@@ -155,7 +155,8 @@ def test_mtp_extends_qsa_and_moe_layer_ranges():
     assert cfg.qwen4_args.mtp_num_hidden_layers == 1
     assert full.layer_ids[-1] == 48
     assert full.num_index_layers == 13
-    assert cfg.num_moe_layers == 49
+    assert cfg.qwen4_args.mtp_bf16_experts
+    assert cfg.num_moe_layers == 48
 
 
 def test_mtp_quantization_uses_its_own_ignore_patterns():
@@ -167,6 +168,8 @@ def test_mtp_quantization_uses_its_own_ignore_patterns():
     assert cfg.dense_quant == "none"
     assert cfg.qwen4_args.mtp_dense_quant == "nvfp4"
     assert cfg.qwen4_args.mtp_num_hidden_layers == 1
+    assert not cfg.qwen4_args.mtp_bf16_experts
+    assert cfg.num_moe_layers == 49
 
 
 def test_ple_on_full_attention_layer_rejected():
