@@ -4,8 +4,9 @@ from importlib import import_module
 
 _EXPORTS = {
     "DeepseekV41Args": "args", "load_args": "args", "parse_config": "config",
+    "checkpoint_quant_config": "config", "DeepseekV41QuantConfig": "config",
     "DeepseekV41ForCausalLM": "model", "iter_weights": "weight",
-    "load_nvfp4_expert_sources": "weight", "load_nvfp4_expert_sources_parallel": "weight",
+    "iter_expert_pieces": "weight",
     "is_expert_tensor": "weight",
 }
 

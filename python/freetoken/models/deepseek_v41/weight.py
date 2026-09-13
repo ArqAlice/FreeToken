@@ -15,10 +15,10 @@ import struct
 import safetensors
 import torch
 
+from freetoken.layers.quantization import QuantKind
 from freetoken.models.loader import drop_page_cache
 from freetoken.models.nvfp4_banks import (
-    Nvfp4ExpertSourceSpec, load_nvfp4_expert_source_banks,
-    load_nvfp4_expert_source_banks_parallel,
+    Nvfp4ExpertSourceSpec, iter_nvfp4_expert_pieces,
 )
 from freetoken.utils import download_hf_weight
 
@@ -138,7 +138,7 @@ class _ShardReader:
 
 def iter_weights(model_path, device, *, include_moe_experts=True, include_non_moe=True):
     if include_moe_experts:
-        raise ValueError("DeepSeek-V4.1 NVFP4 experts require --moe-backend offload")
+        raise ValueError("DeepSeek-V4.1 NVFP4 experts require --moe-strategy offload")
     if not include_non_moe:
         return
     folder = download_hf_weight(model_path)
@@ -173,21 +173,14 @@ _NVFP4_SPEC = Nvfp4ExpertSourceSpec(
 )
 
 
-def load_nvfp4_expert_sources(model_path, config, *, layer_sink=None):
+def iter_expert_pieces(model_path, config, kind, *, parallel=False, workers=8, chunk=8 << 20):
+    if kind is not QuantKind.NVFP4:
+        return None
     folder = download_hf_weight(model_path)
     validate_expert_headers(read_checkpoint_headers(folder), config)
-    return load_nvfp4_expert_source_banks(folder, config, _NVFP4_SPEC,
-                                          drop_page_cache=drop_page_cache, primary=True,
-                                          layer_sink=layer_sink)
+    return iter_nvfp4_expert_pieces(folder, config, _NVFP4_SPEC, parallel=parallel,
+                                    workers=workers, chunk=chunk, drop_page_cache=drop_page_cache)
 
 
-def load_nvfp4_expert_sources_parallel(model_path, config, *, workers=8, chunk=8 << 20, layer_sink=None):
-    folder = download_hf_weight(model_path)
-    validate_expert_headers(read_checkpoint_headers(folder), config)
-    return load_nvfp4_expert_source_banks_parallel(folder, config, _NVFP4_SPEC,
-                                                   drop_page_cache=drop_page_cache, primary=True,
-                                                   workers=workers, chunk=chunk, layer_sink=layer_sink)
-
-
-__all__ = ["iter_weights", "is_expert_tensor", "load_nvfp4_expert_sources",
-           "load_nvfp4_expert_sources_parallel", "read_checkpoint_headers", "validate_expert_headers"]
+__all__ = ["iter_weights", "is_expert_tensor", "iter_expert_pieces",
+           "read_checkpoint_headers", "validate_expert_headers"]

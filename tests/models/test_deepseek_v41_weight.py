@@ -7,12 +7,17 @@ import pytest
 import safetensors.torch
 import torch
 
+from freetoken.layers.quantization import MoEConfig, Nvfp4MoEMethod, QuantKind
+from freetoken.layers.quantization.scheme import nvfp4_scheme
 from freetoken.models.deepseek_v41 import weight
+from freetoken.moe.expert_banks import build_expert_banks
+from freetoken.moe.expert_pieces import iter_expert_pieces
 
 
 @pytest.fixture(params=[True, False], ids=["modelopt_input_scale", "native_no_input_scale"])
 def tiny_shards(tmp_path, request):
-    config = SimpleNamespace(num_layers=1, num_experts=2, hidden_size=32, moe_intermediate_size=32)
+    config = SimpleNamespace(num_layers=1, num_experts=2, hidden_size=32, moe_intermediate_size=32,
+                             architectures=["DeepseekV41ForCausalLM"])
     tensors, globals_ = {}, {}
     for expert in range(2):
         for proj_idx, proj in enumerate(("w1", "w2", "w3"), 1):
@@ -33,16 +38,26 @@ def tiny_shards(tmp_path, request):
     return tmp_path, config
 
 
+def _load_banks(folder, config, *, parallel=False, layer_sink=None):
+    method = Nvfp4MoEMethod(MoEConfig(num_experts=config.num_experts, hidden=config.hidden_size,
+                                     intermediate=config.moe_intermediate_size, top_k=1,
+                                     scheme=nvfp4_scheme(input_scale=False), strategy="offload",
+                                     activation="swiglu_clamp", alpha=1.0, limit=10.0), "triton")
+    pieces = iter_expert_pieces(str(folder), config, QuantKind.NVFP4, parallel=parallel,
+                                workers=2, chunk=4096)
+    return build_expert_banks(method, config.num_layers, pieces, device=torch.device("cpu"),
+                              layer_sink=layer_sink).sources
+
+
 def test_validate_and_load_split_global_scales(tiny_shards):
     folder, config = tiny_shards
     completed = []
-    banks = weight.load_nvfp4_expert_sources(str(folder), config,
-                                           layer_sink=lambda layer, banks: completed.append(layer))
+    banks = _load_banks(folder, config, layer_sink=lambda layer, banks: completed.append(layer))
     assert completed == [0]
     for expert in range(2):
-        assert torch.all(banks["gate_up_packed"][0][expert, :32] == expert * 16 + 1)
-        assert torch.all(banks["gate_up_packed"][0][expert, 32:] == expert * 16 + 3)
-        assert torch.all(banks["down_packed"][0][expert] == expert * 16 + 2)
+        assert torch.all(banks["gate_up"][0][expert, :32] == expert * 16 + 1)
+        assert torch.all(banks["gate_up"][0][expert, 32:] == expert * 16 + 3)
+        assert torch.all(banks["down"][0][expert] == expert * 16 + 2)
         assert torch.all(banks["gate_up_scale"][0][expert, :32].float() == 1)
         assert torch.all(banks["gate_up_scale"][0][expert, 32:].float() == 3)
         assert torch.all(banks["down_scale"][0][expert].float() == 2)
@@ -54,11 +69,24 @@ def test_validate_and_load_split_global_scales(tiny_shards):
 def test_serial_parallel_bank_bytes_match(tiny_shards):
     folder, config = tiny_shards
     sink = lambda layer, banks: None
-    serial = weight.load_nvfp4_expert_sources(str(folder), config, layer_sink=sink)
-    parallel = weight.load_nvfp4_expert_sources_parallel(str(folder), config, workers=2,
-                                                        chunk=4096, layer_sink=sink)
+    serial = _load_banks(folder, config, layer_sink=sink)
+    parallel = _load_banks(folder, config, parallel=True, layer_sink=sink)
     for name in serial:
         assert torch.equal(serial[name][0].view(torch.uint8), parallel[name][0].view(torch.uint8)), name
+
+
+def test_wrong_expert_kind_does_not_decode_nvfp4_as_another_format(tiny_shards):
+    folder, config = tiny_shards
+    assert weight.iter_expert_pieces(str(folder), config, QuantKind.MXFP4) is None
+
+
+def test_expert_stream_validates_headers_before_creating_iterator(tiny_shards, monkeypatch):
+    folder, config = tiny_shards
+    headers = weight.read_checkpoint_headers(folder)
+    del headers["layers.0.ffn.experts.0.w1.weight"]
+    monkeypatch.setattr(weight, "read_checkpoint_headers", lambda folder: headers)
+    with pytest.raises(ValueError, match="Missing NVFP4 tensor"):
+        weight.iter_expert_pieces(str(folder), config, QuantKind.NVFP4)
 
 
 @pytest.mark.parametrize("mutation,match", [

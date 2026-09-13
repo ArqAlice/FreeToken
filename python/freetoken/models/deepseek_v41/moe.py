@@ -62,22 +62,28 @@ class Expert(nn.Module):
 
 
 class DSV41OffloadMoELayer(OffloadMoELayer):
-    def __init__(self, layer_id, args):
+    def __init__(self, layer_id, args, *, strategy="offload", decode_target="gpu", quant_config=None):
+        if quant_config is None:
+            from .config import DeepseekV41QuantConfig
+
+            quant_config = DeepseekV41QuantConfig(args)
         super().__init__(layer_id=layer_id, num_experts=args.n_routed_experts,
                          top_k=args.n_activated_experts, hidden_size=args.dim,
                          intermediate_size=args.moe_inter_dim,
-                         renormalize=args.norm_topk_prob, activation="swiglu_clamp")
-        self.swiglu_limit = args.swiglu_limit
-        self.hidden_act_alpha = 1.0
+                         renormalize=args.norm_topk_prob, activation="swiglu_clamp",
+                         alpha=1.0, limit=args.swiglu_limit,
+                         strategy=strategy, decode_target=decode_target,
+                         quant_config=quant_config, prefix=f"layers.{layer_id}.ffn.experts")
 
 
 class MoE(nn.Module):
-    def __init__(self, layer_id, args):
+    def __init__(self, layer_id, args, *, strategy="offload", decode_target="gpu", quant_config=None):
         super().__init__()
         self.dim = args.dim
         self.gate = Gate(layer_id, args)
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
-        self.experts = DSV41OffloadMoELayer(layer_id, args)
+        self.experts = DSV41OffloadMoELayer(layer_id, args, strategy=strategy,
+                                          decode_target=decode_target, quant_config=quant_config)
 
     def forward(self, x, image_mask=None):
         shape = x.shape

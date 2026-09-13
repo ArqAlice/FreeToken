@@ -23,7 +23,7 @@ def make_identity_pre_mix(x, hc_mult):
 
 
 class Block(nn.Module):
-    def __init__(self, layer_id, args):
+    def __init__(self, layer_id, args, *, strategy="offload", decode_target="gpu", quant_config=None):
         super().__init__()
         self.layer_id = layer_id
         self.dim = args.dim
@@ -32,7 +32,8 @@ class Block(nn.Module):
         self.hc_sinkhorn_iters = args.hc_sinkhorn_iters
         self.hc_eps = args.hc_eps
         self.attn = Attention(layer_id, args)
-        self.ffn = MoE(layer_id, args)
+        self.ffn = MoE(layer_id, args, strategy=strategy, decode_target=decode_target,
+                       quant_config=quant_config)
         self.attn_norm = RMSNorm(args.dim, args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, args.norm_eps)
         self.engram = None
@@ -106,13 +107,18 @@ class Block(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, *, strategy="offload", decode_target="gpu", quant_config=None):
         super().__init__()
+        if quant_config is None:
+            from .config import DeepseekV41QuantConfig
+
+            quant_config = DeepseekV41QuantConfig(args)
         self.args = args
         self.hc_mult = args.hc_mult
         self.embed = nn.Embedding(args.vocab_size, args.dim, dtype=torch.bfloat16)
         self.embed.weight.requires_grad_(False)
-        self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
+        self.layers = nn.ModuleList([Block(i, args, strategy=strategy, decode_target=decode_target,
+                                            quant_config=quant_config) for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, args.norm_eps)
         self.head = OutputHead(args.dim, args.vocab_size)
         self.vision = None
@@ -164,7 +170,10 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
     def __init__(self, config):
         self._config = config
         self._args = config.dsv41_args
-        self._transformer = Transformer(self._args)
+        self._transformer = Transformer(self._args, strategy=config.moe_strategy,
+                                        decode_target=config.decode_target, quant_config=config.quant)
+        # The engine walks BaseOP children; resident nn.Module weights use the adapter below.
+        self._offload_layers = list(self._iter_offload_moe_layers())
         self._bound = False
         self._engram_runtime = None
 

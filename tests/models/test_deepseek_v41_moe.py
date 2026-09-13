@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from freetoken.models.deepseek_v41.moe import Gate, clamped_swiglu
+from freetoken.models.deepseek_v41.moe import DSV41OffloadMoELayer, Gate, clamped_swiglu
 
 
 @pytest.mark.parametrize("score_func", ["softmax", "sigmoid", "sqrtsoftplus"])
@@ -41,3 +41,26 @@ def test_swiglu_clamps_gate_only_above_and_up_both_sides():
     clipped_up = torch.tensor([10., -10., 2., 3.])
     expected = clipped_gate / (1 + (-clipped_gate).exp()) * clipped_up
     torch.testing.assert_close(clamped_swiglu(gate, up, 10.), expected)
+
+
+@pytest.mark.parametrize("strategy,decode_target", [("offload", "gpu"), ("cpu", "cpu"), ("hybrid", "hybrid")])
+def test_native_expert_method_receives_clamp_and_execution_policy(strategy, decode_target):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.quantization import QuantBackend, QuantKind, set_quant_backend
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
+    args = SimpleNamespace(n_layers=1, index_source_layers=(), engram_layer_ids=(),
+                           n_routed_experts=2, n_activated_experts=1, dim=32, moe_inter_dim=32,
+                           norm_topk_prob=True, swiglu_limit=10.0)
+    layer = DSV41OffloadMoELayer(0, args, strategy=strategy, decode_target=decode_target)
+    method = layer.quant_method
+    assert method.kind is QuantKind.NVFP4 and method.kernel.name == "triton"
+    assert (method.cfg.activation, method.cfg.alpha, method.cfg.limit) == ("swiglu_clamp", 1.0, 10.0)
+    assert (layer.alpha, layer.limit) == (1.0, 10.0)
+    assert (method.cfg.strategy, method.cfg.decode_target) == (strategy, decode_target)
+    assert not method.scheme.has("input_scale")
+    assert set(method.layout()) == {"gate_up", "gate_up_scale", "gate_up_global",
+                                    "down", "down_scale", "down_global"}
+    assert not layer.state_dict()

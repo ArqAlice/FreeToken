@@ -47,7 +47,7 @@ the packed KV validation below without requiring a container configuration:
 ```bash
 ft serve --model /path/to/snapshot \
   --served-model-name LibertAIDAI/DeepSeek-V4.1-Flash-NVFP4 \
-  --moe-backend offload --nvfp4-backend triton --expert-load parallel \
+  --moe-strategy offload --quant-backend moe.nvfp4=triton --expert-load parallel \
   --moe-cache-auto --disable-moe-prefill-overlap \
   --cuda-graph-max-bs 0 --kv-cache-dtype fp8-fp4 \
   --max-seq-len-override 32768 --kv-reserve-tokens 32768 \
@@ -67,8 +67,8 @@ cache from measured free GPU memory.
 The engine automatically selects `dsv41_sparse` attention. WSL's existing CPU
 expert fallback remains available when its CUDA pinned-memory quota cannot hold
 the expert banks. CPU and hybrid execution use the same NVFP4 expert values as
-the offload backend. The Triton expert backend supports this model's clamped
-SwiGLU; forcing Marlin or FlashInfer is rejected.
+the offload strategy. The Triton NVFP4 expert kernel supports this model's clamped
+SwiGLU; `moe.nvfp4=marlin` and `moe.nvfp4=b12x` are rejected.
 
 ## Sizing a million-token context
 
@@ -78,7 +78,7 @@ tests. It has not been validated with a full million-token checkpoint run.
 ```bash
 ft serve --model /path/to/snapshot \
   --served-model-name LibertAIDAI/DeepSeek-V4.1-Flash-NVFP4 \
-  --moe-backend offload --nvfp4-backend triton --moe-cache-auto \
+  --moe-strategy offload --quant-backend moe.nvfp4=triton --moe-cache-auto \
   --disable-moe-prefill-overlap \
   --cuda-graph-max-bs 0 --kv-cache-dtype bf16 \
   --max-seq-len-override 1048576 --kv-reserve-tokens 1048576 \

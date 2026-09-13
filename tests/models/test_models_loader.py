@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -181,8 +182,8 @@ def test_stack_expert_tensors_after_all_experts_arrive():
     assert packed[0][1][1].tolist() == [[11.0, 11.0]]
 
 
-def test_stream_moe_expert_sources_writes_layers_into_final_banks():
-    from freetoken.models.loader import stream_moe_expert_sources
+def test_stacked_expert_pieces_pair_each_layer_in_arrival_order():
+    from freetoken.moe.expert_pieces import stacked_expert_pieces
 
     config = SimpleNamespace(num_layers=2, num_experts=2)
     tensors = [
@@ -192,16 +193,46 @@ def test_stream_moe_expert_sources_writes_layers_into_final_banks():
         ("model.layers.0.mlp.experts.down_proj", torch.full((2, 4, 3), 10.0)),
     ]
 
-    gate_up_source, down_source = stream_moe_expert_sources(
-        tensors,
-        config,
-        dtype=torch.bfloat16,
-    )
+    pieces = list(stacked_expert_pieces(tensors, config))
 
-    assert len(gate_up_source) == 2 and all(t.shape == (2, 3, 4) for t in gate_up_source)
-    assert len(down_source) == 2 and all(t.shape == (2, 4, 3) for t in down_source)
-    assert all(t.dtype == torch.bfloat16 for t in gate_up_source + down_source)
-    torch.testing.assert_close(gate_up_source[0], torch.full_like(gate_up_source[0], 2.0))
-    torch.testing.assert_close(gate_up_source[1], torch.full_like(gate_up_source[1], 3.0))
-    torch.testing.assert_close(down_source[0], torch.full_like(down_source[0], 10.0))
-    torch.testing.assert_close(down_source[1], torch.full_like(down_source[1], 11.0))
+    assert [(layer, e0, e1) for layer, e0, e1, _ in pieces] == [(1, 0, 2), (0, 0, 2)]
+    assert torch.equal(pieces[0][3]["gate_up"], torch.full((2, 3, 4), 3.0))
+    assert torch.equal(pieces[0][3]["down"], torch.full((2, 4, 3), 11.0))
+    assert torch.equal(pieces[1][3]["gate_up"], torch.full((2, 3, 4), 2.0))
+    with pytest.raises(ValueError, match="Missing MoE expert source layers"):
+        list(stacked_expert_pieces(tensors[:3], config))
+
+
+@pytest.mark.parametrize("per_layer", [False, True], ids=["flat", "per-layer"])
+@pytest.mark.parametrize("quant_format", ["q4_0", "unknown-format"])
+def test_ftw_legacy_q4_0_banks_keep_native_bytes(tmp_path, monkeypatch, per_layer, quant_format):
+    from freetoken.checkpoint.ftw import FTWWriter, layer_bank_entry_name, load_ftw_banks
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    writer = FTWWriter(str(tmp_path), shard_limit=8192)
+    sources = {
+        "gate_up": torch.arange(2 * 2 * 72, dtype=torch.int64).to(torch.uint8).reshape(2, 2, 72),
+        "down": torch.arange(2 * 2 * 36, dtype=torch.uint8).reshape(2, 2, 36),
+    }
+    for name, value in sources.items():
+        if per_layer:
+            for layer, rows in enumerate(value):
+                writer.add_tensor(layer_bank_entry_name(name, layer), rows, kind="experts_bank")
+        else:
+            writer.add_tensor(name, value.flatten(0, 1), kind="experts_bank")
+    writer.finalize({"quant_format": quant_format, "expert_bank_num_layers": 2})
+
+    if quant_format != "q4_0":
+        with pytest.raises(KeyError, match="unknown-format"):
+            load_ftw_banks(str(tmp_path), num_layers=2, layer_residency=["pageable"] * 2)
+        return
+    banks = load_ftw_banks(str(tmp_path), num_layers=2, layer_residency=["pageable"] * 2)
+    assert banks.quant_format == "q4_0"
+    assert banks.kind is None and banks.kernel is None
+    assert banks.layer_residency == ["pageable"] * 2
+    assert set(banks.sources) == set(sources)
+    for name, value in sources.items():
+        assert len(banks.sources[name]) == 2
+        for layer, rows in enumerate(banks.sources[name]):
+            assert rows.dtype is torch.uint8
+            torch.testing.assert_close(rows, value[layer], rtol=0, atol=0)

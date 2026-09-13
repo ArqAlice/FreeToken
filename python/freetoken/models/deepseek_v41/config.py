@@ -2,9 +2,50 @@
 
 from __future__ import annotations
 
+from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, WeightDesc
+from freetoken.layers.quantization.scheme import nvfp4_scheme
 from freetoken.models.config import DSV41AttentionGroupConfig, ModelConfig, RotaryConfig
 
 from .args import as_dict, load_args
+
+
+class DeepseekV41QuantConfig(QuantConfig):
+    """Native block-32 projections and W4A16 NVFP4 routed experts."""
+
+    dialect = "deepseek_v41"
+    STORAGE = {
+        QuantKind.FP8_BLOCK: {"weight": "weight", "weight_scale_inv": "scale"},
+        QuantKind.NVFP4: {"weight": "weight", "weight_scale": "weight_scale",
+                          "weight_global": "weight_scale_2"},
+    }
+
+    def __init__(self, args):
+        super().__init__()
+        self._fp8 = QuantScheme(QuantKind.FP8_BLOCK, WeightDesc("e4m3", (32, 32), "e8m0"),
+                                {"weight", "weight_scale_inv"})
+        self._nvfp4 = nvfp4_scheme(input_scale=False)
+        self._experts = {f"layers.{i}.ffn.experts" for i in range(args.n_layers)}
+        self._projections = set()
+        for i in range(args.n_layers):
+            prefix = f"layers.{i}"
+            self._projections.update(f"{prefix}.attn.{name}" for name in ("wq_a", "wq_b", "wkv", "wo_b"))
+            self._projections.update(f"{prefix}.ffn.shared_experts.{name}" for name in ("w1", "w2", "w3"))
+            if i in args.index_source_layers:
+                self._projections.add(f"{prefix}.attn.indexer.wq_b")
+            if i in args.engram_layer_ids:
+                self._projections.add(f"{prefix}.engram.wkv")
+
+    def scheme_for_name(self, name):
+        prefix, _, suffix = name.partition(".experts")
+        if prefix + ".experts" in self._experts:
+            if not suffix or (len(parts := suffix.split(".")) == 3
+                              and parts[1].isdigit() and parts[2] in {"w1", "w2", "w3"}):
+                return self._nvfp4
+        return self._fp8 if name in self._projections else None
+
+
+def checkpoint_quant_config(hf_config):
+    return DeepseekV41QuantConfig(parse_config(hf_config).dsv41_args)
 
 
 def parse_config(hf_config) -> ModelConfig:
@@ -54,7 +95,7 @@ def parse_config(hf_config) -> ModelConfig:
         num_experts=args.n_routed_experts, num_experts_per_tok=args.n_activated_experts,
         moe_intermediate_size=args.moe_inter_dim, norm_topk_prob=args.norm_topk_prob,
         model_type="deepseek_v41", architectures=["DeepseekV41ForCausalLM"],
-        moe_backend="offload", moe_enabled=True, expert_quant="nvfp4",
+        moe_strategy="offload", moe_enabled=True, expert_quant="nvfp4",
         weight_block_size=(32, 32), n_shared_experts=args.n_shared_experts,
         shared_expert_intermediate_size=args.moe_inter_dim,
         routed_scaling_factor=args.route_scale, swiglu_limit=args.swiglu_limit,
@@ -69,4 +110,4 @@ def parse_config(hf_config) -> ModelConfig:
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["parse_config", "checkpoint_quant_config", "DeepseekV41QuantConfig"]

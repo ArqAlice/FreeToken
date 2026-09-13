@@ -168,7 +168,7 @@ def test_target_long_context_auto_plan_fits_conservative_30_gib_baseline(kv_quan
         baseline_free=30 << 30, weights_bytes=weights, memory_ratio=.9,
         cache_per_page=per_page, fixed_cache_size=fixed, per_expert_bytes=expert_bytes,
         num_experts=384, total_experts=40 * 384, prefill_overlap=False,
-        kv_reserve_tokens=max(1048576, floor), page_size=P, quant_format="nvfp4",
+        kv_reserve_tokens=max(1048576, floor), page_size=P, max_slots=None,
     )
     assert slots >= 384 and pages * P >= 1048576 and not overlap
     exact_kv = dsv41_pool_bytes(_dsv41_pool_sizes(config, pages + 1), a, 3, kv_quant)

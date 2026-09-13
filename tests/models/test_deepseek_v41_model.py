@@ -69,13 +69,22 @@ def test_hc_sinkhorn_and_combination_match_float_reference(device):
 
 def test_target_builds_metadata_without_allocating_experts_or_engram_tables():
     from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.quantization import finalize_quant, QuantKind
     from freetoken.models.deepseek_v41.config import parse_config
+    from freetoken.models.deepseek_v41.model import DeepseekV41ForCausalLM
+    from freetoken.moe.offload_cache import iter_offload_moe_layers
 
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
     raw = json.loads((Path(__file__).parent / "fixtures/deepseek_v41_nvfp4_config.json").read_text())
     with torch.device("meta"):
-        model = Transformer(parse_config(raw).dsv41_args)
+        adapter = DeepseekV41ForCausalLM(parse_config(raw))
+    model = adapter._transformer
+    experts = list(iter_offload_moe_layers(adapter))
+    assert len(experts) == 40
+    assert all(expert is layer.ffn.experts for expert, layer in zip(experts, model.layers))
+    assert all(expert.quant_method.kind is QuantKind.NVFP4 for expert in experts)
+    assert finalize_quant(adapter) == 40
     params = dict(model.named_parameters())
     assert sum(p.numel() * p.element_size() for p in params.values()) == 12_190_720_448
     assert "head.weight" in params
