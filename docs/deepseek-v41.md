@@ -2,15 +2,15 @@
 
 This branch adds experimental text and image inference for
 [`LibertAIDAI/DeepSeek-V4.1-Flash-NVFP4`](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-NVFP4),
-pinned at revision `dfce15b92ed1fa76e80e2a46ba847e5b5451f12c` in Compose.
+validated at revision `dfce15b92ed1fa76e80e2a46ba847e5b5451f12c`.
 The earlier `s-zaizen/DeepSeek-V4.1-Flash-NVFP4` checkpoint with FP8 Engram
 tables remains supported.
 The implementation uses the checkpoint's native names and shapes. It does not
 instantiate model code downloaded from the Hub.
 
-## Docker on one RTX 5090
+## Requirements on one RTX 5090
 
-The configuration targets one 32 GiB RTX 5090 and approximately 480 GiB of WSL
+The launch example targets one 32 GiB RTX 5090 and approximately 480 GiB of WSL
 memory on a 512 GiB host. The LibertAIDAI checkpoint occupies about 429 GB
 (400 GiB). Routed expert banks require 285.04 GiB of host memory; the 97.28 GiB
 Engram tables remain packed on disk and in the OS page cache. Only requested
@@ -27,98 +27,22 @@ The publisher describes the expert transcode as lossless but the Engram FP8 to
 FP4 conversion as lossy, and has not published end-to-end quality evaluations.
 Successful smoke tests cannot establish equivalent answer quality.
 
-Use a Docker named volume on an SSD. Allow space for both the original checkpoint
-and another approximately 429 GB if creating an FTW copy. Growing the Docker data
-VHDX to 2 TiB provides capacity for these files and the existing caches on this
-machine; the Windows drive must also have enough physical free space.
+Allow SSD space for the approximately 429 GB checkpoint and runtime caches, plus
+another approximately 429 GB if creating an FTW copy. Download the revision above
+with a Hugging Face client, then pass the completed local snapshot directory to
+`--model` in the launch command below.
 
-```bash
-docker compose up --build -d
-docker compose logs -f download freetoken
-```
-
-The `download` service downloads the pinned snapshot into the shared `hf-cache`
-volume with 16 file workers and Xet high performance mode. The server waits for
-successful completion, then loads that exact local snapshot with Hub networking
-disabled. Downloaded files survive container recreation and interrupted downloads
-can resume. To download without starting inference:
-
-```bash
-docker compose run --rm download
-```
-
-`HF_DOWNLOAD_WORKERS` and `HF_XET_HIGH_PERFORMANCE` can be set in `.env`. More file
-workers can help only while bandwidth, CPU and storage permit; no throughput
-improvement from these two Docker settings alone has been established. Xet's high
-performance setting attempts to use the available network and CPU resources.
-See the [Hugging Face environment variable documentation](https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables).
-
-The initial serving defaults are 32,768 context tokens, 1,024 tokens per prefill
-chunk and two concurrent requests. They provide a starting point for validation
-on a 32 GiB GPU. To change them, set `FT_MAX_SEQ_LEN`, `FT_KV_RESERVE_TOKENS`,
-`FT_MAX_PREFILL_LENGTH` and `FT_MAX_RUNNING_REQUESTS` in `.env`. Increasing the
-context limit alone does not reserve the corresponding KV capacity. Full-checkpoint
-long-context throughput and memory limits still need to be measured.
-
-## Faster downloads on Windows
-
-On this Windows/WSL machine, native Windows downloads reached 2.8 Gbps over a
-30-second measurement. Aggregate host NIC receive throughput reached 3.27 Gbps
-over another 20-second measurement, compared with approximately 0.6 Gbps through
-Docker Desktop. These are download observations on this connection, not inference
-benchmarks or a guarantee for another network. The Windows helper downloads into
-a staging directory, then imports verified files into the same Docker cache.
-Allow enough free space for both the Windows staging files and the Docker copy.
-The LibertAIDAI download also reached 2.94 Gbps over a 30-second measurement
-without authentication; a later measurement during cache import was 2.71 Gbps.
-The final two Engram shards sustained 3.12 Gbps in another 30-second sample.
-The complete Windows download took 17 minutes 50 seconds; Docker cache import
-was partly overlapped and is additional work.
-
-Install `uv` and prepare a token file outside the repository if authentication is
-needed. The helper reads only the file named by `HF_TOKEN_PATH`; it does not save
-the token or pass it to Docker. Omit that environment variable for public access.
-Run from the repository root in PowerShell:
-
-```powershell
-$stage = Join-Path $env:TEMP "freetoken-libertai-v41-download"
-uv run --no-project --with huggingface_hub==1.31.0 --with hf-xet==1.6.0 python scripts/download_hf_windows.py `
-  --stage-dir $stage --repo-id LibertAIDAI/DeepSeek-V4.1-Flash-NVFP4 `
-  --revision dfce15b92ed1fa76e80e2a46ba847e5b5451f12c --volume freetoken_hf-cache
-```
-
-Downloading defaults to 32 file workers with Xet high performance mode. Importing
-defaults to 4 workers, processing the largest completed files first; use
-`--import-workers 1` for sequential copying. To import completed files from an
-existing or still downloading staging directory without downloading:
-
-```powershell
-uv run --no-project python scripts/download_hf_windows.py --import-only `
-  --stage-dir $stage --repo-id LibertAIDAI/DeepSeek-V4.1-Flash-NVFP4 `
-  --revision dfce15b92ed1fa76e80e2a46ba847e5b5451f12c --volume freetoken_hf-cache `
-  --import-workers 4
-```
-
-A bounded read test on this machine measured 160.6 MiB/s for one Docker bind
-reader and 281.9 MiB/s aggregate for four readers, including SHA256 work (64 MiB
-per case, while downloads and imports were active). These small, cached reads
-indicate useful concurrency but do not predict complete-checkpoint copy time.
-
-The importer requires the local `freetokenfp8-local:cu130` image; `--image` can
-select another image with Python at `/opt/venv/bin/python`. It mounts staging read
-only and disables container networking. It verifies shard SHA256 values against
-Hugging Face download metadata before atomically publishing blobs and creating
-Linux snapshot symlinks. Incomplete files are skipped. Repeated imports reuse
-existing immutable snapshot links without rehashing, and preserve unrelated files.
-Workers keep a separate lock for each content hash. If a copy fails, no further
-copies are scheduled; pending work is canceled and active copies finish or clean
-up their temporary files before the error is returned.
-The helper never removes staging files or Docker volumes. A partial import is not
-a complete model: finish downloading and importing before starting inference.
+The launch example uses a 32,768-token context, 1,024-token prefill chunks and two
+concurrent requests. Adjust `--max-seq-len-override`, `--kv-reserve-tokens`,
+`--max-prefill-length` and `--max-running-requests` for your workload. Increasing
+the context limit alone does not reserve the corresponding KV capacity.
+Full-checkpoint long-context throughput and memory limits still need measurement.
 
 ## Direct launch
 
-With a downloaded snapshot or standalone FTW directory:
+After [installing FreeToken](install.md), run this command with a downloaded
+snapshot or standalone FTW directory. It expresses the model settings used in
+the packed KV validation below without requiring a container configuration:
 
 ```bash
 ft serve --model /path/to/snapshot \
@@ -128,14 +52,15 @@ ft serve --model /path/to/snapshot \
   --cuda-graph-max-bs 0 --kv-cache-dtype fp8-fp4 \
   --max-seq-len-override 32768 --kv-reserve-tokens 32768 \
   --max-prefill-length 1024 --max-running-requests 2 \
+  --swa-full-tokens-ratio 0.2 \
   --host 0.0.0.0 --port 1919
 ```
 
-On this approximately 500 GB RAM host, Compose explicitly loads expert banks in
+On the validation host, the launch configuration explicitly loaded expert banks in
 parallel. The expert reader excludes the two large Engram shards; its banks and
 temporary shard buffers fit within this host's RAM. The generic automatic check
-counts the whole checkpoint and would choose serial loading. Set `FT_EXPERT_LOAD`
-to `serial` for a lower-memory host. Prefill overlap is disabled initially so the
+counts the whole checkpoint and would choose serial loading. Use
+`--expert-load serial` for a lower-memory host. Prefill overlap is disabled so the
 GPU cache does not require two complete expert layers, and the planner sizes the
 cache from measured free GPU memory.
 
@@ -219,9 +144,9 @@ packed in GPU memory. This mode uses `dsv41_sparse` attention with BF16 compute;
 `--attention-backend auto` selects it. Generic `fp8` and `nvfp4` KV modes remain
 unsupported for V4.1 because their layouts differ.
 
-Compose defaults to `fp8-fp4`. Set `FT_KV_CACHE_DTYPE=bf16` in `.env` to use the
-previous representation, then recreate the `freetoken` service. The standalone
-CLI default remains `bf16`.
+The launch example selects `fp8-fp4` explicitly. Use `--kv-cache-dtype bf16` to
+select the previous representation, then restart the server. The CLI default
+remains `bf16`.
 
 | Stored tier | Native format | Bytes per row, including scales | BF16 bytes per row |
 | --- | --- | ---: | ---: |
@@ -263,18 +188,22 @@ engine configuration and the shared page manager. A subsequent focused CUDA
 test also passed for two requests crossing odd compression and page boundaries,
 with identical outputs and shared index IDs between BF16 and packed storage.
 
+The equivalent focused test command from the repository root is shown below.
+The recorded run invoked `python -m pytest` inside a private development
+container; the container configuration is not part of this repository.
+
 ```bash
-docker exec -e PYTHONDONTWRITEBYTECODE=1 freetoken-kv-dev python -m pytest \
-  /workspace/tests/kernels/test_dsv41_quant.py \
-  /workspace/tests/kernels/test_dsv41_sparse.py \
-  /workspace/tests/kernels/test_dsv41_indexer.py \
-  /workspace/tests/models/test_dsv41_attention.py \
-  /workspace/tests/models/test_deepseek_v41_model.py \
-  /workspace/tests/engine/test_deepseek_v41_engine.py \
-  /workspace/tests/kvcache/test_dsv41_pool.py \
-  /workspace/tests/engine/test_kv_quant_config.py \
-  /workspace/tests/engine/test_attention_backend_matrix.py \
-  /workspace/tests/scheduler/test_dsv4_generic_manager.py -q -p no:cacheprovider
+uv run python -m pytest \
+  tests/kernels/test_dsv41_quant.py \
+  tests/kernels/test_dsv41_sparse.py \
+  tests/kernels/test_dsv41_indexer.py \
+  tests/models/test_dsv41_attention.py \
+  tests/models/test_deepseek_v41_model.py \
+  tests/engine/test_deepseek_v41_engine.py \
+  tests/kvcache/test_dsv41_pool.py \
+  tests/engine/test_kv_quant_config.py \
+  tests/engine/test_attention_backend_matrix.py \
+  tests/scheduler/test_dsv4_generic_manager.py -q -p no:cacheprovider
 ```
 
 The native codecs reproduce the BF16 roundtrip values exactly. Index scores and
@@ -305,20 +234,17 @@ The baseline is this branch's existing V4.1 BF16 implementation. The repository'
 unmodified base at `04d4621` lacks this V4.1 model path and cannot serve as a
 same-checkpoint baseline.
 
-The production image
+The private validation image was
 `sha256:d6f7429ed8939fd981d2e26359f377deddaf1e926839c8ccfe3e09403b2d4ad3`
-was built and started with:
-
-```bash
-docker build --tag freetokenfp8-local:kv-fp8-fp4-candidate .
-docker image tag freetokenfp8-local:kv-fp8-fp4-candidate freetokenfp8-local:cu130
-docker compose up -d --no-deps --no-build --force-recreate freetoken
-```
+and used the model settings in [Direct launch](#direct-launch). Image digests
+identify local validation artifacts; they are not published images or build
+instructions. The private Dockerfile, Compose configuration and download helper
+are outside the scope of this repository.
 
 All 390 Python source files in the image matched the tested workspace. The
 server became ready at 21:27:26 UTC on September 11, using the pinned LibertAIDAI
-checkpoint, one RTX 5090 and the Compose settings above. The automatic planner
-resolved the following allocations; pool byte counts include its owned tensors:
+checkpoint and one RTX 5090. The automatic planner resolved the following
+allocations; pool byte counts include its owned tensors:
 
 | Allocation | Previous BF16 image | FP8-FP4 image |
 | --- | ---: | ---: |
@@ -363,11 +289,6 @@ measurement of compilation cost. Different expert/page allocations and cache
 warming also affect these results. Prefill attention remains slower in the
 isolated comparison above, and unseen context lengths can incur more compilation.
 
-Compose enables a container init process and a one-minute shutdown grace period.
-The previous container briefly entered Docker's zombie-process state during
-replacement; the new settings provide child-process reaping and more time for
-the large model to shut down.
-
 ## Implementation and current limits
 
 - V4.1 has a separate model registration and nested-config parser. It implements
@@ -411,11 +332,13 @@ all 388 Python source files in that image matched the tested workspace.
 
 All 48 shards (429,406,627,896 bytes) matched their SHA256 download etags during
 Docker import. The final cache passed size checks for all 90 repository files
-and safetensors/index checks for all 143,317 tensors. The temporary Windows copy
-was removed after verification; the earlier model cache was retained.
+and safetensors/index checks for all 143,317 tensors. This was checkpoint
+verification in the private validation environment, not a repository download
+or import workflow.
 
-On 2026-09-11 UTC, `docker compose up --no-build -d` started the new image on the
-same RTX 5090/driver 591.86 host. The API became ready at 20:23:03 UTC, 169 seconds
+On 2026-09-11 UTC, the private container setup started the image on the same
+RTX 5090/driver 591.86 host, using the [Direct launch](#direct-launch) settings
+with `--kv-cache-dtype bf16`. The API became ready at 20:23:03 UTC, 169 seconds
 after process startup; parallel expert reading took 144 seconds. The resolved
 cache retained 818 experts and 259 KV pages, with 14 CPU-decode layers and 26
 GPU-offload layers. The engine reported 2.98 GiB of free GPU memory after
@@ -466,11 +389,9 @@ PyTorch `2.11.0+cu130`. The tested Docker image was
 All 48 checkpoint shards, totaling 527,293,384,648 bytes, matched their SHA256
 etags; all 188,245 tensor entries matched the checkpoint index.
 
-The startup command was:
-
-```bash
-docker compose up --no-build -d
-```
+The private container setup used the [Direct launch](#direct-launch) settings
+with `--kv-cache-dtype bf16`, the local s-zaizen snapshot as `--model`, and
+`s-zaizen/DeepSeek-V4.1-Flash-NVFP4` as `--served-model-name`.
 
 This run used a 32,768-token context, 1,024-token prefill chunks, two concurrent
 request slots, parallel expert loading, automatic MoE cache sizing and disabled
@@ -516,7 +437,7 @@ registration introduced by this change was fixed, followed by 30 passing targete
 tests. Four GLM failures also reproduced at the unchanged HEAD (`04d462149e21`). An intermittent
 device-to-device copy test failed in the broader run and passed five isolated
 reruns; this does not establish a clean full-suite result. Separate focused runs
-passed nine tests in the built Docker image and 22 Windows-download helper tests.
+passed nine tests in the private validation image.
 These counts describe separate runs and are not added together.
 
 The adapted reference components retain their upstream MIT attribution in
