@@ -282,7 +282,7 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "role": "tool",
                 "tool_call_id": item.get("call_id", ""),
-                "content": _stringify(item.get("output")),
+                "content": _tool_output(item.get("output")),
             }
         ]
     if itype == "reasoning":
@@ -328,11 +328,25 @@ def _merge_assistant_run(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return merged
 
 
-def _input_text(content: Any) -> str:
+def _input_text(content: Any) -> str | list[dict[str, Any]]:
     if content is None:
         return ""
     if isinstance(content, str):
         return content
+    if any(isinstance(p, dict) and p.get("type") == "input_image" for p in content):
+        converted = []
+        for part in content:
+            if not isinstance(part, dict):
+                raise ValueError("image message content must contain typed parts")
+            if part.get("type") == "input_image":
+                if not part.get("image_url"):
+                    raise ValueError("input_image requires image_url; uploaded file IDs are not supported")
+                converted.append({"type": "image_url", "image_url": {"url": part["image_url"]}})
+            elif part.get("type") in ("input_text", "output_text", "text"):
+                converted.append({"type": "text", "text": part.get("text") or ""})
+            else:
+                raise ValueError(f"Unsupported image message content type: {part.get('type')}")
+        return converted
     parts: list[str] = []
     for part in content:
         if isinstance(part, dict):
@@ -351,6 +365,14 @@ def _stringify(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value)
     return str(value)
+
+
+def _tool_output(value: Any) -> str | list[dict[str, Any]]:
+    if isinstance(value, list) and any(
+        isinstance(part, dict) and part.get("type") == "input_image" for part in value
+    ):
+        return _input_text(value)
+    return _stringify(value)
 
 
 def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:

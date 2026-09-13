@@ -43,6 +43,7 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    media: list[dict] | None = None
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---

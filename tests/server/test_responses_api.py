@@ -15,6 +15,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _PY = os.path.join(_ROOT, "python")
 if _PY not in sys.path:
@@ -62,6 +64,19 @@ def test_convert_string_input_and_instructions():
     assert spec.sampling_params.max_tokens == 50
 
 
+def test_responses_preserves_image_between_text_parts():
+    req = ResponsesRequest.model_validate({"model": "deepseek-v41", "input": [
+        {"role": "user", "content": [
+            {"type": "input_text", "text": "before"},
+            {"type": "input_image", "image_url": "https://example.com/p.png"},
+            {"type": "input_text", "text": "after"},
+        ]},
+    ]})
+    content = RP.convert_responses_to_genspec(req, {}).messages[0]["content"]
+    assert [p["type"] for p in content] == ["text", "image_url", "text"]
+    assert content[1]["image_url"]["url"] == "https://example.com/p.png"
+
+
 def test_convert_defaults_max_output_tokens_when_omitted():
     # codex omits max_output_tokens; must NOT fall to the 16-token floor (bug b1).
     req = ResponsesRequest.model_validate({"model": "gpt-x", "input": "hi"})
@@ -96,6 +111,58 @@ def test_convert_list_input_with_tool_roundtrip_and_tools():
     assert tool_msg["role"] == "tool" and tool_msg["tool_call_id"] == "call_1" and tool_msg["content"] == "72F"
     assert spec.template_tools[0]["function"]["name"] == "get_weather"
     assert spec.parse_tools
+
+
+def test_function_output_preserves_ordered_images_and_text():
+    output = [
+        {"type": "input_text", "text": "first image"},
+        {"type": "input_image", "image_url": "https://example.com/first.png"},
+        {"type": "input_text", "text": "second image"},
+        {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
+        {"type": "input_text", "text": "compare them"},
+    ]
+    fake = FakeState([("same", True, 5, 1)])
+    response = _client(fake).post("/v1/responses", json={"model": "deepseek-v41", "input": [
+        {"type": "function_call", "call_id": "call_image", "name": "inspect", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_image", "output": output},
+    ]})
+    assert response.status_code == 200, response.text
+    tool = fake.last_sent.text[-1]
+    assert tool == {
+        "role": "tool", "tool_call_id": "call_image", "content": [
+            {"type": "text", "text": "first image"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/first.png"}},
+            {"type": "text", "text": "second image"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+            {"type": "text", "text": "compare them"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("output", [
+    {"result": [1, 2], "text": "raw object"},
+    [1, {"value": 2}, "three"],
+    [{"type": "input_text", "text": "text-only output retains JSON compatibility"}],
+    {"type": "input_image", "image_url": "https://example.com/data-field.png"},
+    [],
+])
+def test_function_output_preserves_non_media_json(output):
+    req = ResponsesRequest(model="m", input=[
+        {"type": "function_call_output", "call_id": "call_1", "output": output},
+    ])
+    message = RP.convert_responses_to_genspec(req, {}).messages[0]
+    assert message["content"] == json.dumps(output)
+
+
+def test_function_output_rejects_uploaded_image_file_ids():
+    fake = FakeState([])
+    response = _client(fake).post("/v1/responses", json={"model": "deepseek-v41", "input": [
+        {"type": "function_call_output", "call_id": "call_1", "output": [
+            {"type": "input_image", "file_id": "file_1"},
+        ]},
+    ]})
+    assert response.status_code == 400
+    assert "image_url" in response.json()["error"]["message"]
 
 
 def test_convert_reasoning_item_merges_into_assistant_turn():

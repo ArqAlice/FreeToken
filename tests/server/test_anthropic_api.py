@@ -739,6 +739,22 @@ def test_count_tokens_excluded_from_request_ring():
     request_ring.reset()
 
 
+def test_anthropic_preserves_images_in_messages_and_tool_results():
+    source = {"type": "base64", "media_type": "image/png", "data": "YWJj"}
+    req = AnthropicMessagesRequest.model_validate({"model": "deepseek-v41", "max_tokens": 4,
+        "messages": [
+            {"role": "user", "content": [{"type": "image", "source": source}, {"type": "text", "text": "describe"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call1", "name": "capture", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call1", "content": [
+                {"type": "text", "text": "screenshot"}, {"type": "image", "source": source},
+            ]}]},
+        ]})
+    messages, *_ = A.convert_anthropic_prompt(req)
+    assert messages[0]["content"][0]["source"] == source
+    assert messages[2]["role"] == "tool"
+    assert messages[2]["content"][1]["source"] == source
+
+
 def test_count_tokens_image_only_message_400():
     # Message list is non-empty on the wire but empty after block filtering: the neutral
     # count_prompt_tokens raises ValueError -> 400, not a 500 from an empty chat template.

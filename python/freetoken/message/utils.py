@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Type
+import math
 
-import numpy as np
 import torch
 
 
@@ -11,6 +11,10 @@ _TYPE_KEY = "__type__"
 # may legitimately use our tag key as a field name. Wrapping such a dict keeps the decoder from
 # reading it as a serialized class -- without this, a request could crash the tokenizer worker.
 _RAW_DICT_KEY = "__raw_dict__"
+_TENSOR_DTYPES = {str(dtype): dtype for dtype in (
+    torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+    torch.float16, torch.bfloat16, torch.float32, torch.float64,
+)}
 
 
 def _serialize_any(value: Any) -> Any:
@@ -32,10 +36,12 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        if self.device.type != "cpu" or str(self.dtype) not in _TENSOR_DTYPES:
+            raise ValueError("message tensors must use a supported CPU dtype")
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
+        serialized["buffer"] = self.detach().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
         serialized["dtype"] = str(self.dtype)
+        serialized["shape"] = list(self.shape)
         return serialized
 
     # normal type
@@ -64,14 +70,20 @@ def _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any:
 
 def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     type_name = data["__type__"]
-    # we can only serialize 1D tensor for now
     if type_name == "Tensor":
         buffer = data["buffer"]
-        dtype_str = data["dtype"].replace("torch.", "")
-        np_dtype = getattr(np, dtype_str)
-        assert isinstance(buffer, bytes)
-        np_tensor = np.frombuffer(buffer, dtype=np_dtype)
-        return torch.from_numpy(np_tensor.copy())
+        dtype = _TENSOR_DTYPES.get(data["dtype"])
+        if dtype is None or not isinstance(buffer, bytes):
+            raise ValueError("invalid serialized tensor dtype or data")
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        shape = data.get("shape", [len(buffer) // itemsize])
+        if (not isinstance(shape, (list, tuple)) or len(shape) > 8
+                or any(type(n) is not int or n < 0 for n in shape)
+                or math.prod(shape) * itemsize != len(buffer)):
+            raise ValueError("serialized tensor shape does not match its data")
+        if not buffer:
+            return torch.empty(shape, dtype=dtype)
+        return torch.frombuffer(bytearray(buffer), dtype=dtype).reshape(shape)
 
     cls = cls_map.get(type_name)
     if cls is None:

@@ -188,9 +188,7 @@ def resolve_sampling(
 
 
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize OpenAI-shaped message dicts for the chat template: flatten text
-    content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
+    """Normalize text/tool messages while preserving ordered image content."""
     return [_render_message(m) for m in messages]
 
 
@@ -198,7 +196,10 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        if any(isinstance(p, dict) and p.get("type") in ("image", "image_url") for p in content):
+            m["content"] = _image_content_parts(content)
+        else:
+            m["content"] = _flatten_text_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -228,6 +229,30 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
             rendered.append(tc)
         m["tool_calls"] = rendered
     return m
+
+
+def _image_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
+    normalized = []
+    for part in parts:
+        kind = part.get("type") if isinstance(part, dict) else None
+        if kind == "text":
+            normalized.append(dict(part))
+            continue
+        if kind == "image_url":
+            image_url = part.get("image_url")
+            url = image_url if isinstance(image_url, str) else (image_url or {}).get("url")
+        elif kind == "image":
+            source = part.get("source") or {}
+            if source.get("type") == "base64" and isinstance(source.get("data"), str):
+                normalized.append(dict(part))
+                continue
+            url = part.get("url") or source.get("url")
+        else:
+            raise ValueError(f"Unsupported content part type: {kind}")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://", "data:image/")):
+            raise ValueError("images require an HTTP(S) URL or a base64 image data URL")
+        normalized.append(dict(part))
+    return normalized
 
 
 def _flatten_text_parts(parts: list[Any]) -> str:

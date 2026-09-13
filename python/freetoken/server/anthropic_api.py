@@ -214,8 +214,7 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                # Text-only server: drop image blocks rather than failing the request.
-                continue
+                content_parts.append({"type": "image", "source": block.source})
             elif block.type == "tool_use":
                 tool_calls.append(
                     {
@@ -233,7 +232,7 @@ def convert_anthropic_prompt(
                         {
                             "role": "tool",
                             "tool_call_id": block.tool_use_id or block.id or "",
-                            "content": _tool_result_text(block.content),
+                            "content": _tool_result_content(block.content),
                         }
                     )
                 else:
@@ -255,7 +254,7 @@ def convert_anthropic_prompt(
             else:
                 openai_msg["content"] = content_parts
         elif not tool_calls and not thinking_parts:
-            # Nothing usable in this message (e.g. image-only) — skip it.
+            # Opaque blocks such as redacted_thinking contain no model input.
             continue
         other.append(openai_msg)
 
@@ -331,6 +330,12 @@ def _content_text(content) -> str:
     if isinstance(content, str):
         return content
     return "".join(b.text for b in content if getattr(b, "type", None) == "text" and b.text)
+
+
+def _tool_result_content(content):
+    if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "image" for p in content):
+        return [dict(p) for p in content if isinstance(p, dict) and p.get("type") in ("text", "image")]
+    return _tool_result_text(content)
 
 
 def _tool_result_text(content) -> str:

@@ -71,7 +71,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
-| `--kv-cache-dtype` | bf16 | `bf16`, `fp8`, or `nvfp4` (see [NVFP4 KV cache](#nvfp4-kv-cache)): FP8 stores the KV cache as e4m3 codes plus one fp32 scale per (token, kv head), roughly doubling the tokens that fit in the same VRAM; see [FP8 KV cache](#fp8-kv-cache) |
+| `--kv-cache-dtype` | bf16 | `bf16`, `fp8`, `nvfp4`, or `fp8-fp4`. Generic [FP8](#fp8-kv-cache) and [NVFP4](#nvfp4-kv-cache) use their own scale layouts; [DeepSeek-V4.1](deepseek-v41.md#native-fp8-fp4-kv-storage) uses `fp8-fp4` to preserve its native FP8 window, FP4 compressed KV and MXFP4 index keys. |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
 
 ### FP8 KV cache

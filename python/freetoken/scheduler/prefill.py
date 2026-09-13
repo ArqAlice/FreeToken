@@ -185,6 +185,7 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
+            media=pending_req.media,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -245,7 +246,7 @@ class PrefillManager:
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds, media=req.media)
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:

@@ -14,11 +14,11 @@ JIT, which needs nvcc):
 - store: ``element_size = num_kv_heads * head_dim * dtype_bytes``, one per
   paged-KV attention group (kvcache/mha_pool.py, kvcache/hybrid_swa_pool.py) and
   per KV width: 2 for the 16-bit cache, 1 for an fp8 one (``--kv-cache-dtype
-  fp8``, kvcache/mha_pool.py). DSV4 writes its MLA latent via torch scatter and
-  contributes nothing.
+  fp8``, kvcache/mha_pool.py). DSV4/V4.1 write MLA latents via torch scatter and
+  contribute nothing.
 - index: ``element_size = hidden_size * 2`` (bf16 embedding row) paired with
   the runtime ``num_splits_for`` rule (layers/embedding.py -> kernel/index.py).
-  DSV4 (plain nn.Embedding) and GGUF embeddings (GGUFEmbedding) bypass it.
+  DSV4/V4.1 (plain nn.Embedding) and GGUF embeddings (GGUFEmbedding) bypass it.
 
 The whole table targets the shipped serving configuration: TP=1 (TP>1 shards
 kv heads, shrinking the store row) and a 2-byte compute dtype (``--dtype
@@ -332,6 +332,16 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=2048,
         expert_formats=("ds_fp4",),
         embed_indexing=False,  # plain nn.Embedding
+    ),
+    AotModel(
+        name="s-zaizen/DeepSeek-V4.1-Flash-NVFP4",
+        architecture="DeepseekV41ForCausalLM",
+        hidden_size=5120,
+        kv_groups=(),
+        top_k=6,
+        moe_intermediate_size=2304,
+        expert_formats=("nvfp4",),
+        embed_indexing=False,
     ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(

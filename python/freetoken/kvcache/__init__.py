@@ -31,6 +31,11 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     cover duck-typed test configs that don't implement it."""
     from freetoken.attention import AttnType
 
+    if getattr(model_config, "dsv41_args", None) is not None:
+        from .dsv41_paged_pool import DSV41PagedKVCache
+
+        return DSV41PagedKVCache
+
     specs_fn = getattr(model_config, "kv_cache_group_specs", None)
     if specs_fn is None:
         if getattr(model_config, "dsv4_args", None) is not None:
@@ -42,6 +47,10 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
         return MHAKVCache
     specs = list(specs_fn())
     types = {spec.attn_type for spec in specs}
+    if AttnType.DSV41 in types:
+        from .dsv41_paged_pool import DSV41PagedKVCache
+
+        return DSV41PagedKVCache
     if AttnType.DSV4 in types:
         from .dsv4_paged_pool import DSV4PagedKVCache
 
@@ -97,6 +106,20 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
 
     model_config = config.model_config
     kv_quant = getattr(config, "kv_quant", "none")
+    if getattr(model_config, "dsv41_args", None) is not None:
+        from .dsv41_cost_model import _dsv41_pool_sizes
+        from .dsv41_paged_pool import DSV41PagedKVCache
+
+        if kv_quant not in ("none", "fp8-fp4"):
+            _reject_unsupported_quant("DeepSeek-V4.1 paged", kv_quant)
+        pool = DSV41PagedKVCache(
+            sizes=_dsv41_pool_sizes(config, num_pages + 1), args=model_config.dsv41_args,
+            device=device, dtype=dtype, P=model_config.dsv41_args.window_size,
+            n_scratch=config.max_running_req + 1,
+            kv_quant=kv_quant,
+        )
+        pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
+        return pool
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
@@ -144,6 +167,8 @@ def create_kvcache_pool(
     num_req_slots: int | None = None,
     kv_quant: str = "none",
 ) -> BaseKVCachePool:
+    if kv_quant == "fp8-fp4":
+        raise ValueError("--kv-cache-dtype fp8-fp4 requires the DeepSeek-V4.1 paged pool")
     if kv_quant == "nvfp4":
         from freetoken.attention import AttnType
 

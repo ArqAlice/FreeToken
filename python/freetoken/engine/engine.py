@@ -85,6 +85,8 @@ def _required_attn_types(model_config) -> frozenset[AttnType]:
     dsv4_args marks DSV4 (the real config declares a DSV4 attention group)."""
     specs_fn = getattr(model_config, "kv_cache_group_specs", None)
     if specs_fn is None:
+        if getattr(model_config, "dsv41_args", None) is not None:
+            return frozenset({AttnType.DSV41})
         if getattr(model_config, "dsv4_args", None) is not None:
             return frozenset({AttnType.DSV4})
         return frozenset({AttnType.FULL})
@@ -115,7 +117,10 @@ def _backend_requirements_met(name: str) -> bool:
 
 
 # --kv-cache-dtype spellings -> the stored EngineConfig.kv_quant value.
-KV_QUANT_ALIASES = {"auto": "none", "bf16": "none", "none": "none", "fp8": "fp8", "nvfp4": "nvfp4"}
+KV_QUANT_ALIASES = {
+    "auto": "none", "bf16": "none", "none": "none", "fp8": "fp8",
+    "nvfp4": "nvfp4", "fp8-fp4": "fp8-fp4",
+}
 
 
 def _resolve_kv_quant(value: str | None) -> str:
@@ -134,10 +139,10 @@ def _backend_supports_kv_quant(name: str, kv_quant: str) -> bool:
     KV pool (an unquantized pool needs nothing from the backend)."""
     if kv_quant == "none":
         return True
-    if kv_quant not in ("fp8", "nvfp4"):
+    if kv_quant not in ("fp8", "nvfp4", "fp8-fp4"):
         return False
     return all(
-        getattr(attention_backend_info(part.strip()), f"supports_{kv_quant}_kv")
+        getattr(attention_backend_info(part.strip()), f"supports_{kv_quant.replace('-', '_')}_kv")
         for part in name.split(",")
     )
 
@@ -151,6 +156,8 @@ def _resolve_auto_attention_backend(
     Reproduces the historical hardware tree for FULL-only models:
     sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton."""
     candidates: list[tuple[str, bool]] = []
+    if AttnType.DSV41 in required:
+        candidates.append(("dsv41_sparse", True))
     if AttnType.DSV4 in required:
         candidates.append(("dsv4_sparse", True))
     if required & {AttnType.MLA, AttnType.DSA}:
@@ -212,7 +219,7 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
             valid = [
                 name
                 for name in (
-                    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "m3_sparse",
+                    "fa", "fi", "trtllm", "triton", "dsa", "dsv4_sparse", "dsv41_sparse", "m3_sparse",
                     "qsa_sparse",
                 )
                 if required <= attention_backend_info(name).supported_types
@@ -310,6 +317,8 @@ def _make_dummy_weight_state_dict(
             t = torch.empty(param.shape, dtype=param.dtype, device=device)
             t.view(torch.uint8).random_(0, 16)
             state_dict[key] = t
+        elif param.dtype == torch.float8_e8m0fnu:
+            state_dict[key] = torch.full(param.shape, 127, dtype=torch.uint8, device=device).view(param.dtype)
         elif param.dtype.is_floating_point or param.dtype.is_complex:
             state_dict[key] = torch.randn(param.shape, dtype=param.dtype, device=device)
         elif param.dtype == torch.uint8 and key.endswith("weight_scale_inv"):
@@ -379,14 +388,6 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
-        post_weights_free = self._sync_get_memory()[0]
-        self._weights_bytes = self._baseline_free - post_weights_free
-        # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
-        # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
-        # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
-        # unlike a query-time mem_get_info it doesn't drift with allocator caching, CUDA
-        # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
-        self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
@@ -395,6 +396,11 @@ class Engine:
         self._host_tables_bytes = 0
         if hasattr(self.model, "load_host_tables"):
             self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+        # Auxiliary host tables can own persistent GPU staging (V4.1 Engram). Measure it
+        # with the resident weights before dividing the remaining budget between pools.
+        post_weights_free = self._sync_get_memory()[0]
+        self._weights_bytes = self._baseline_free - post_weights_free
+        self._post_weights_free = post_weights_free
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -411,6 +417,12 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        if config.kv_quant == "fp8-fp4":
+            logger.info_rank0(
+                "KV storage fp8-fp4: window=FP8 E4M3/UE8M0 block32, "
+                "compressed=FP4 E2M1/E4M3 block16, index=MXFP4 E2M1/UE8M0 block32; "
+                f"pool={self.kv_cache.total_bytes() / (1024 ** 2):.2f} MiB"
+            )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
@@ -1104,21 +1116,25 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
 
 
 def _adjust_dsv4_config(config: EngineConfig, override) -> None:
-    """DSV4 engine-config reconciliation at config-resolution time (before the pool exists).
-    Syncs the resolved runtime config into the opaque ``dsv4_args`` payload, sets
-    page_size to the window page P, forces single-chunk prefill, and clamps cuda_graph_bs/max_bs to
-    the DSV4 decode batch size.
-    """
+    """Resolve the V4/V4.1 paged-window geometry before allocating the model."""
     model_config = config.model_config
-    model_config.dsv4_args.max_seq_len = config.max_seq_len
-    model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    is_v41 = getattr(model_config, "dsv41_args", None) is not None
+    args = model_config.dsv41_args if is_v41 else model_config.dsv4_args
+    args.max_seq_len = config.max_seq_len
+    args.max_batch_size = config.max_running_req + 1  # +1 dummy
     # config.swa_full_tokens_ratio is the DSV4 window/full ratio directly (default sizing);
     # a runtime rebuild pins an absolute window via swa_num_pages_override instead.
     # DSV4's KV page IS the P-token window page (window == radix reuse granularity == lcm of
     # the compress ratios), so max_num_tokens = num_pages * page_size holds like every model.
-    P = model_config.dsv4_args.window_size
+    P = args.window_size
     override("page_size", P)
-    logger.info_rank0(f"DSV4 KV pages are {P}-token window pages; page_size set to {P}")
+    model_name = "DSV4.1" if is_v41 else "DSV4"
+    logger.info_rank0(f"{model_name} KV pages are {P}-token window pages; page_size set to {P}")
+    if is_v41:
+        if not 0 < config.swa_full_tokens_ratio <= 1:
+            raise ValueError("DeepSeek-V4.1 swa_full_tokens_ratio must be in (0, 1]")
+        if getattr(config, "max_extend_tokens", config.max_seq_len) < min(P, config.max_seq_len):
+            raise ValueError(f"DeepSeek-V4.1 --max-prefill-length must fit one {P}-token page")
     # The generic CacheManager materializes DSV4 'radix' as the shared SWARadixCache (is_swa);
     # 'naive' stays naive with the pool's swa currency riding swa_paged.
     if getattr(config, "cache_type", "radix") != "naive":
@@ -1127,7 +1143,7 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     # honored, as is an explicit 'naive'. Don't let max_extend_tokens force a second chunk within
     # one prompt (the pool's prefill_chunk_budget still chunks prompts larger than the window
     # pool); prefill batches ragged (bs>=1), each segment resuming from its own cached_len.
-    if getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
+    if not is_v41 and getattr(config, "max_extend_tokens", 0) < config.max_seq_len:
         override("max_extend_tokens", config.max_seq_len)
 
     # DSV4 decode batches at most max_running_req rows; its full-loc snapshot is sized to that,
@@ -1286,7 +1302,15 @@ def _adjust_config(config: EngineConfig):
 
     model_config = config.model_config
     single_stream_only = getattr(model_config, "single_stream_only", False)
-    is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
+    if getattr(model_config, "dsv41_args", None) is not None:
+        if config.dtype != torch.bfloat16:
+            raise ValueError("DeepSeek-V4.1 requires --dtype bfloat16 for its quantized attention path")
+        if (getattr(config, "cuda_graph_max_bs", None) or 0) > 0 or getattr(config, "cuda_graph_bs", None):
+            raise ValueError("DeepSeek-V4.1 currently uses eager execution; set --cuda-graph-max-bs 0")
+        override("cuda_graph_max_bs", 0)
+        override("cuda_graph_bs", [])
+    is_dsv4 = (getattr(model_config, "dsv4_args", None) is not None
+               or getattr(model_config, "dsv41_args", None) is not None)
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
@@ -1369,7 +1393,13 @@ def _adjust_config(config: EngineConfig):
         for spec in model_config.kv_cache_group_specs():
             if spec.head_dim % 16:
                 raise ValueError("--kv-cache-dtype nvfp4 requires head_dim divisible by 16")
-    if kv_quant != "none":
+    if kv_quant == "fp8-fp4":
+        if required_attn_types != {AttnType.DSV41}:
+            raise ValueError("--kv-cache-dtype fp8-fp4 requires DeepSeek-V4.1 attention")
+        from freetoken.kvcache.dsv41_layout import dsv41_row_bytes
+
+        dsv41_row_bytes(model_config.dsv41_args, kv_quant)
+    elif kv_quant != "none":
         # Quantized codes are wired through the pools that hand their rows to a Triton
         # kernel: plain paged and hybrid-SWA, QSA sparse, and DSA/MLA. QSA's index
         # tier and DSA's index-key/tail tiers stay bf16; the DSA kernel dequantizes

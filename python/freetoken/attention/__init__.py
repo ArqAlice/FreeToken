@@ -39,6 +39,7 @@ class BackendInfo:
     # avoids) them for --kv-cache-dtype fp8.
     supports_fp8_kv: bool = False
     supports_nvfp4_kv: bool = False
+    supports_fp8_fp4_kv: bool = False
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -108,6 +109,16 @@ def create_dsv4_sparse_backend(config: ModelConfig):
     from .dsv4_sparse import DSV4SparseAttnBackend
 
     return DSV4SparseAttnBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "dsv41_sparse",
+    BackendInfo(supported_types=frozenset({AttnType.DSV41}), supports_fp8_fp4_kv=True),
+)
+def create_dsv41_sparse_backend(config: ModelConfig):
+    from .dsv41_sparse import DSV41SparseAttnBackend
+
+    return DSV41SparseAttnBackend(config)
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(

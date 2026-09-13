@@ -113,6 +113,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _window_ratio(value: str) -> float:
+        try:
+            ratio = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number in (0, 1]") from exc
+        if not 0 < ratio <= 1:
+            raise argparse.ArgumentTypeError("must be in (0, 1]")
+        return ratio
+
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -157,6 +166,8 @@ def parse_args(
             return "qwen3_coder"
         if "qwen" in marker:
             return "qwen25"
+        if "deepseek" in marker and any(tag in marker for tag in ("v41", "v4.1", "v4_1")):
+            return "deepseekv41"
         if "deepseek" in marker and ("v4" in marker or "deepseek_v4" in marker):
             return "deepseekv32"
         if "deepseek" in marker and ("v3.2" in marker or "v32" in marker):
@@ -369,19 +380,27 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--swa-full-tokens-ratio",
+        type=_window_ratio,
+        default=ServerArgs.swa_full_tokens_ratio,
+        help="Window-pool tokens per full-history token for paged sliding-window caches, in (0, 1].",
+    )
+
+    parser.add_argument(
         "--kv-cache-dtype",
         dest="kv_quant",
         type=str,
         default=ServerArgs.kv_quant,
-        choices=["auto", "bf16", "fp8", "nvfp4"],
+        choices=["auto", "bf16", "fp8", "nvfp4", "fp8-fp4"],
         help=(
             "KV-cache storage format. 'bf16' (default) stores the compute dtype; 'fp8'"
             " stores e4m3 codes plus one fp32 scale per (token, kv head), roughly "
-            "doubling the tokens that fit in the same VRAM. Requires the triton"
-            " attention backend and a plain paged, hybrid-SWA or QSA sparse KV pool"
-            " (not MLA/DSA, DSV4, or MiniMax-M3 block-sparse models)."
+            "doubling the tokens that fit in the same VRAM. Requires a compatible"
+            " Triton attention backend and a paged FULL, hybrid-SWA, QSA, or MLA/DSA pool."
             " 'nvfp4' stores packed E2M1 with block/row scales; supports only"
-            " paged FULL, hybrid-SWA, or QSA sparse attention with head_dim divisible by 16."
+            " paged FULL, hybrid-SWA, QSA, or MLA/DSA attention with head_dim divisible by 16."
+            " 'fp8-fp4' preserves DeepSeek-V4.1's native FP8 window, FP4 compressed KV,"
+            " and MXFP4 index keys in packed storage; requires bfloat16 compute."
         ),
     )
 
@@ -456,6 +475,7 @@ def parse_args(
             "qwen3_coder",
             "mistral",
             "deepseekv32",
+            "deepseekv41",
             "gemma4",
             "glm47",
             "minimax",

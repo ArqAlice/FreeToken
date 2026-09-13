@@ -51,6 +51,7 @@ def _model_config(kind):
         "dsa": (_spec("full", AttnType.DSA, mla=True, index_head_dim=128),),
         "kpool": (_spec("full", AttnType.DSA, mla=True, index_head_dim=128, index_ratio=4),),
         "dsv4": (_spec("dsv4", AttnType.DSV4, sliding_window=128),),
+        "dsv41": (_spec("dsv41", AttnType.DSV41, sliding_window=128),),
         "bsa": (_spec("full", AttnType.BSA, index_head_dim=128),),
         "qsa": (_spec("full", AttnType.QSA, index_head_dim=128, index_ratio=4),),
     }[kind]
@@ -58,6 +59,8 @@ def _model_config(kind):
         mc.has_swa_attention = True
     if kind == "dsv4":
         mc.dsv4_args = SimpleNamespace(window_size=128)
+    if kind == "dsv41":
+        mc.dsv41_args = SimpleNamespace(window_size=128, head_dim=64, index_head_dim=128)
     if kind in ("qsa", "kpool"):
         mc.has_linear_attention = True
     mc.kv_cache_group_specs = lambda: specs
@@ -96,6 +99,7 @@ def test_kv_quant_spellings():
     assert _resolve_kv_quant("bf16") == "none"
     assert _resolve_kv_quant("FP8") == "fp8"
     assert _resolve_kv_quant("NVFP4") == "nvfp4"
+    assert _resolve_kv_quant("FP8-FP4") == "fp8-fp4"
     assert _resolve_kv_quant(None) == "none"
     with pytest.raises(ValueError, match="kv-cache-dtype"):
         _resolve_kv_quant("q8")
@@ -120,6 +124,59 @@ def test_only_the_backends_that_read_scales_declare_fp8_support():
         if attention_backend_info(name).supports_nvfp4_kv
     }
     assert nvfp4 == {"triton", "qsa_sparse", "dsa"}
+
+    mixed = {
+        name
+        for name in SUPPORTED_ATTENTION_BACKENDS.supported_names()
+        if attention_backend_info(name).supports_fp8_fp4_kv
+    }
+    assert mixed == {"dsv41_sparse"}
+
+
+@pytest.mark.parametrize("backend", ["auto", "dsv41_sparse"])
+def test_native_mixed_selects_v41_backend(monkeypatch, backend):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_fast_machine(monkeypatch)
+    config = _config("dsv41", attention_backend=backend, kv_quant="fp8-fp4")
+    _adjust_config(config)
+    assert config.kv_quant == "fp8-fp4"
+    assert config.attention_backend == "dsv41_sparse"
+
+
+@pytest.mark.parametrize("kind", ["full", "swa", "mla", "dsa", "kpool", "dsv4", "bsa", "qsa"])
+def test_native_mixed_rejects_other_architectures(monkeypatch, kind):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.kvcache import create_kvcache_pool
+
+    _patch_fast_machine(monkeypatch)
+    config = _config(kind, attention_backend="auto", kv_quant="fp8-fp4")
+    with pytest.raises(ValueError, match="fp8-fp4 requires DeepSeek-V4.1"):
+        _adjust_config(config)
+    with pytest.raises(ValueError, match="fp8-fp4 requires the DeepSeek-V4.1"):
+        create_kvcache_pool(config.model_config, num_pages=4, page_size=128,
+                            dtype=torch.bfloat16, device=torch.device("cpu"), kv_quant="fp8-fp4")
+
+
+@pytest.mark.parametrize("field", ["head_dim", "index_head_dim"])
+def test_native_mixed_rejects_partial_blocks_before_loading(monkeypatch, field):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_fast_machine(monkeypatch)
+    config = _config("dsv41", attention_backend="auto", kv_quant="fp8-fp4")
+    setattr(config.model_config.dsv41_args, field, 72)
+    with pytest.raises(ValueError, match="divisible by 32"):
+        _adjust_config(config)
+
+
+def test_native_mixed_requires_bf16_reconstruction(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_fast_machine(monkeypatch)
+    config = _config("dsv41", attention_backend="auto", kv_quant="fp8-fp4")
+    object.__setattr__(config, "dtype", torch.float16)
+    with pytest.raises(ValueError, match="requires --dtype bfloat16"):
+        _adjust_config(config)
 
 
 def test_auto_avoids_the_fast_backends_for_fp8(monkeypatch):
@@ -168,7 +225,7 @@ def test_nvfp4_auto_selects_triton(monkeypatch):
     assert config.attention_backend == "triton"
 
 
-@pytest.mark.parametrize("kind", ["dsv4", "bsa"])
+@pytest.mark.parametrize("kind", ["dsv4", "dsv41", "bsa"])
 def test_nvfp4_rejects_unsupported_pools_before_allocation(monkeypatch, kind):
     from freetoken.engine.engine import _adjust_config
     from freetoken.kvcache import create_kvcache_pool
@@ -238,7 +295,7 @@ def test_mla_and_dsa_select_the_scale_reading_backend(monkeypatch, kind, backend
     assert config.page_size == (64 if kind == "kpool" else 1)
 
 
-@pytest.mark.parametrize("kind", ["dsv4", "bsa"])
+@pytest.mark.parametrize("kind", ["dsv4", "dsv41", "bsa"])
 def test_pool_families_without_a_scale_read_path_are_rejected(monkeypatch, kind):
     from freetoken.engine.engine import _adjust_config
 
