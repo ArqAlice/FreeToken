@@ -346,7 +346,9 @@ def test_qsa_layer_matches_hf_dense():
     x = (torch.randn(seq_len, config.hidden_size, device=device, dtype=dtype) * 0.5)
     positions = torch.arange(seq_len, device=device, dtype=torch.int64)
     req = SimpleNamespace(extend_len=seq_len, cached_len=0, table_idx=1)
-    batch = SimpleNamespace(padded_reqs=[req], reqs=[req], positions=positions)
+    batch = SimpleNamespace(
+        padded_reqs=[req], reqs=[req], positions=positions, get_attn_positions=lambda: positions
+    )
 
     backend = TorchDenseQSAReference(config, num_slots=4, max_len=64, device=device, dtype=dtype)
     _fresh_ctx(attn_backend=backend)
@@ -473,10 +475,11 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
     last = torch.tensor(
         [sum(len(p) for p in prompts[: i + 1]) - 1 for i in range(len(prompts))], device=device
     )
+    positions = torch.cat([torch.arange(len(p)) for p in prompts]).to(device)
     batch = SimpleNamespace(
         padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=True, is_decode=False,
         input_ids=torch.tensor(flat, dtype=torch.int64, device=device),
-        positions=torch.cat([torch.arange(len(p)) for p in prompts]).to(device),
+        positions=positions, get_attn_positions=lambda: positions, mm_embeds=None,
         attn_metadata=SimpleNamespace(get_last_indices=lambda bs: last[:bs]),
     )
     with ctx.forward_batch(batch):
@@ -488,10 +491,11 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
         r.cached_len = len(p)
         r.extend_len = 1
         r.input_ids = torch.cat([r.input_ids, torch.tensor([14], dtype=torch.int64)])
+    decode_positions = torch.tensor([len(p) for p in prompts], dtype=torch.int64, device=device)
     decode = SimpleNamespace(
         padded_reqs=reqs, reqs=reqs, size=len(reqs), is_prefill=False, is_decode=True,
         input_ids=torch.tensor([14] * len(reqs), dtype=torch.int64, device=device),
-        positions=torch.tensor([len(p) for p in prompts], dtype=torch.int64, device=device),
+        positions=decode_positions, get_attn_positions=lambda: decode_positions, mm_embeds=None,
         attn_metadata=None,
     )
     with ctx.forward_batch(decode):
@@ -513,7 +517,7 @@ def test_nvfp4_experts_and_kv_preserve_full_model_continuation(checkpoint, monke
     from freetoken.kvcache.qsa_pool import QSAKVCache
     from freetoken.layers.quantization import NameMap, QuantBackend, QuantConfig, QuantKind
     from freetoken.layers.quantization import finalize_quant
-    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForConditionalGeneration
     from freetoken.models.qwen4_exp.ple import PLE_CONV_STATE, PLE_NGRAM_STATE
     from freetoken.models.register import get_model_spec
     from freetoken.moe.expert_banks import build_expert_banks
@@ -533,7 +537,7 @@ def test_nvfp4_experts_and_kv_preserve_full_model_continuation(checkpoint, monke
                         QuantBackend.parse("moe.nvfp4=triton"))
     device, dtype = torch.device("cuda"), torch.bfloat16
     with torch.device(device), torch_dtype(dtype):
-        model = Qwen4ExpForCausalLM(config)
+        model = Qwen4ExpForConditionalGeneration(config)
     gen = torch.Generator(device=device).manual_seed(63)
     _fill(model, gen, scale=.03)
     assert finalize_quant(model) > config.num_layers

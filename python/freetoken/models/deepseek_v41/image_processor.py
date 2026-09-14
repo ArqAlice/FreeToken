@@ -157,11 +157,19 @@ def plan_image_grid(width: int, height: int, args):
 
 def load_image(record, args):
     """Load and transform one image record into ViT patches."""
-    p = args.vision_patch_size
     with Image.open(io.BytesIO(load_image_bytes(record))) as source:
         if source.width * source.height > MAX_IMAGE_PIXELS:
             raise ValueError("image exceeds the 64 megapixel limit")
         image = source.convert("RGB")
+    return process_image(image, args)
+
+
+def process_image(image, args):
+    """Apply the native resize and normalization to an already decoded image."""
+    p = args.vision_patch_size
+    if image.width * image.height > MAX_IMAGE_PIXELS:
+        raise ValueError("image exceeds the 64 megapixel limit")
+    image = image.convert("RGB")
     n_llm_h, n_llm_w, best_height, best_width = plan_image_grid(image.width, image.height, args)
     n_vit_h, n_vit_w = best_height // p, best_width // p
     if args.vision_max_wh_ratio is not None and image.width >= args.vision_max_wh_ratio * image.height:

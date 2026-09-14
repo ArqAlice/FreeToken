@@ -69,6 +69,22 @@ def test_hash_rejects_wrong_bucket_geometry():
         HashLayout.from_args(args)
 
 
+def test_content_pad_ids_use_image_boundaries_before_vocabulary_lookup():
+    from freetoken.models.deepseek_v41.engram import _image_flags
+
+    args, mapping = _args(), np.arange(7, dtype=np.int64)
+    layout = HashLayout.from_args(args)
+    ids = np.array([1, 3, 5, 6, 4, 1, 3, 6])
+    req = SimpleNamespace(mm_items=[SimpleNamespace(offsets=[[2, 4]])])
+    flags = _image_flags(req, 0, len(ids))
+    expected = hash_token_run(ids, flags, mapping, layout, args.engram_pad_id)
+    ids[2:4] = [1_000_100, 1_000_100]
+    np.testing.assert_array_equal(hash_token_run(ids, flags, mapping, layout, args.engram_pad_id), expected)
+    np.testing.assert_array_equal(_image_flags(req, 3, 4), [True, False, False, False])
+    with pytest.raises(ValueError, match="outside the tokenizer"):
+        hash_token_run(ids, np.zeros_like(flags), mapping, layout, args.engram_pad_id)
+
+
 def test_compressed_tokens_match_training_normalization():
     texts = [" The", "the", "THE", "\u00e9", "e", "\uff25", " ", "\t", "",
              "a\r\n\tb", "a b", "\ufffd", "\ufffd"]

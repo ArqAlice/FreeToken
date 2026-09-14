@@ -11,12 +11,13 @@ import pytest
 import torch
 
 
-def test_finalized_weights_and_engram_staging_precede_cache_budgets(monkeypatch, tmp_path):
+@pytest.mark.parametrize("active_encoder", [False, True])
+def test_finalized_weights_and_engram_staging_precede_cache_budgets(monkeypatch, tmp_path, active_encoder):
     import freetoken.engine.engine as engine_module
 
     allocations = {}
     baseline_free = 4096
-    resident_and_staging_bytes = 48 + 32 * 4 + 16 * 2 + 8
+    resident_and_staging_bytes = 48 + 32 * 4 + 16 * 2 + 8 + (12 if active_encoder else 0)
     host_table_bytes = 1024
     cache_bytes = 64
 
@@ -36,8 +37,19 @@ def test_finalized_weights_and_engram_staging_precede_cache_budgets(monkeypatch,
         def load_state_dict(self, weights):
             self.weight = weights["weight"]
             allocations["weight"] = self.weight
+            if active_encoder:
+                allocations["encoder_weights"] = torch.empty(256, dtype=torch.uint8, device="cpu")
+
+        def place_encoder_weights(self, mode):
+            assert mode == "host" and self.quant_method.calls == 1
+            del allocations["encoder_weights"]
+            allocations["encoder_staging"] = torch.empty(12, dtype=torch.uint8, device="cpu")
+
+        def encode(self, item):
+            raise AssertionError("encoder warmup is stubbed in the memory-budget test")
 
         def load_host_tables(self, config):
+            assert not active_encoder or "encoder_staging" in allocations
             allocations["engram_values"] = torch.empty(16, dtype=torch.bfloat16, device="cpu")
             allocations["engram_mask"] = torch.empty(8, dtype=torch.bool, device="cpu")
             return host_table_bytes
@@ -57,6 +69,9 @@ def test_finalized_weights_and_engram_staging_precede_cache_budgets(monkeypatch,
         model_path=str(tmp_path), tp_info=SimpleNamespace(rank=0, size=1),
         dtype=torch.bfloat16, quant_backend="moe.nvfp4=triton", moe_strategy="offload",
         model_config=object(), page_size=8, memory_ratio=0.75,
+        active_encoders=(SimpleNamespace(kind="vision"),) if active_encoder else (),
+        mm=SimpleNamespace(encoder_weights="host", embed_cache_device="cpu"),
+        served_modalities={"image"} if active_encoder else set(), hf_config=SimpleNamespace(),
     )
 
     def free_memory(self):
@@ -93,11 +108,13 @@ def test_finalized_weights_and_engram_staging_precede_cache_budgets(monkeypatch,
         "weight": torch.ones(24, dtype=torch.uint8, device="cpu"),
     })
     monkeypatch.setattr(engine_module.Engine, "_init_offload_moe_cache", initialize_offload_cache)
+    monkeypatch.setattr("freetoken.mm.processor.get_mm_processor", lambda *args: object())
+    monkeypatch.setattr(engine_module.Engine, "_warmup_encoders", lambda self: None)
     with pytest.raises(ReachedKVPlanning):
         engine_module.Engine(config)
 
 
-def _run_engine_smoke(folder, port, kv_quant):
+def _run_engine_smoke(folder, port, kv_quant, image_path):
     import json
     from dataclasses import asdict
     from unittest.mock import patch
@@ -111,6 +128,7 @@ def _run_engine_smoke(folder, port, kv_quant):
     from freetoken.moe.offload_cache import iter_offload_moe_layers
     from freetoken.models.deepseek_v41.args import DeepseekV41Args
     from freetoken.models.deepseek_v41.image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
+    from freetoken.scheduler.mm import plan_mm_batch
 
     args = DeepseekV41Args(
         n_layers=3, n_mtp_layers=0, compress_ratios=(0, 2, 2),
@@ -170,9 +188,12 @@ def _run_engine_smoke(folder, port, kv_quant):
         assert method.cfg.strategy == "offload" and method.cfg.decode_target == "gpu"
     assert engine.model._transformer.vision.patch_embed.proj.weight.dtype == torch.bfloat16
     runtime = engine.model._engram_runtime
-    resident_bytes = sum(p.numel() * p.element_size() for p in engine.model.state_dict().values())
+    resident_bytes = sum(p.numel() * p.element_size() for p in engine.model.state_dict().values() if p.is_cuda)
     staged_bytes = sum(module._values.numel() * module._values.element_size() for module in runtime.modules)
     staged_bytes += runtime.device_mask.numel() * runtime.device_mask.element_size()
+    vision_streamer = engine.model._transformer.vision._streamer
+    assert vision_streamer is not None and vision_streamer.bank.is_pinned()
+    staged_bytes += vision_streamer.device_bytes
     assert engine._weights_bytes >= resident_bytes + staged_bytes
     sample = engine.sampler.sample
 
@@ -186,8 +207,14 @@ def _run_engine_smoke(folder, port, kv_quant):
         engine.kv_cache.bind_window_pages(start, start)
     media = [{"start": 1, "types": torch.tensor([IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END]),
               "patches": torch.randn(4, 3, 2, 2), "n_vit_h": 2, "n_vit_w": 2}]
-    req = Req(torch.tensor([5, 127, 127, 127, 127, 6, 7, 8], dtype=torch.int32),
-              0, 0, 3, 0, SamplingParams(temperature=0), None, media=media)
+    ids = torch.tensor([5, 127, 127, 127, 127, 6, 7, 8], dtype=torch.int32)
+    if image_path == "mm_items":
+        result = engine.mm_processor.from_media(ids, media)
+        req = Req(result.input_ids, 0, 0, 3, 0, SamplingParams(temperature=0), None, mm_items=result.mm_items)
+        for item in req.mm_items:
+            engine.encoder_cache.register(item.hash, req.uid, item.num_tokens)
+    else:
+        req = Req(ids, 0, 0, 3, 0, SamplingParams(temperature=0), None, media=media)
     for phase in ("prefill", "decode"):
         batch = Batch([req], phase)
         batch.padded_reqs = batch.reqs
@@ -195,6 +222,10 @@ def _run_engine_smoke(folder, port, kv_quant):
         batch.positions = torch.arange(req.cached_len, req.device_len, device="cuda")
         batch.active_table_idx = torch.tensor([0], dtype=torch.long, device="cuda")
         batch.out_loc = engine.page_table[0, req.cached_len:req.device_len]
+        if phase == "prefill" and req.mm_items:
+            jobs, plan, rows = plan_mm_batch([req], engine.encoder_cache)
+            batch.mm_encoder_jobs, batch.mm_gather_plan = jobs, plan
+            batch.mm_rows = torch.tensor(rows, device="cuda", dtype=torch.long)
         engine.attn_backend.prepare_metadata(batch)
         with torch.inference_mode():
             output = engine.forward_batch(batch, engine.sampler.prepare(batch))
@@ -202,7 +233,11 @@ def _run_engine_smoke(folder, port, kv_quant):
         assert output.next_tokens_cpu.shape == (1,)
         assert 0 <= output.next_tokens_cpu.item() < 128
         req.append_host(output.next_tokens_cpu)
-    assert "embeddings" in media[0]
+    if image_path == "mm_items":
+        assert req.mm_items[0].feature is None
+        assert not engine.encoder_cache.has(req.mm_items[0].hash)
+    else:
+        assert "embeddings" in media[0]
     assert req.cached_len == 9 and req.device_len == 10
     torch.cuda.synchronize()
     torch.distributed.destroy_process_group()
@@ -211,15 +246,16 @@ def _run_engine_smoke(folder, port, kv_quant):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("kv_quant", ["none", "fp8-fp4"], ids=["bf16", "fp8-fp4"])
-def test_engine_initialization_and_image_generation(tmp_path, kv_quant):
+@pytest.mark.parametrize("image_path", ["legacy", "mm_items"])
+def test_engine_initialization_and_image_generation(tmp_path, kv_quant, image_path):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(tmp_path), str(port), kv_quant],
+    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), str(tmp_path), str(port), kv_quant, image_path],
                             capture_output=True, text=True, timeout=180, env=os.environ.copy())
     assert result.returncode == 0, result.stdout + result.stderr
     assert "V41_ENGINE_PREFILL_DECODE_IMAGE_OK" in result.stdout
 
 
 if __name__ == "__main__":
-    _run_engine_smoke(sys.argv[1], int(sys.argv[2]), sys.argv[3])
+    _run_engine_smoke(sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4])

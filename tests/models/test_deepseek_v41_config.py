@@ -45,6 +45,20 @@ def test_parse_needs_no_local_inference_file(checkpoint_config):
     assert parse_config(hf_config) == parse_config(checkpoint_config)
 
 
+def test_explicit_vision_disable_preserves_native_quantization(checkpoint_config):
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
+    from freetoken.layers.quantization import QuantKind
+
+    checkpoint_config["vision_config"] = None
+    config = parse_config(checkpoint_config)
+    assert not config.is_multimodal and not config.dsv41_args.vision_enabled
+    spec = get_model_spec("DeepseekV41ForCausalLM")
+    assert spec.encoders[0].modalities == ("image",) and spec.mm_processor is not None
+    quant = checkpoint_quant_config("unused", checkpoint_config, spec)
+    assert quant.scheme_for_name("layers.2.attn.wq_a").kind is QuantKind.FP8_BLOCK
+    assert quant.scheme_for_name("layers.2.ffn.experts").kind is QuantKind.NVFP4
+
+
 def test_libertai_native_nvfp4_with_packed_engram(libertai_config):
     from freetoken.utils.hf import RawConfigShim
 

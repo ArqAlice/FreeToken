@@ -236,3 +236,24 @@ def test_ftw_legacy_q4_0_banks_keep_native_bytes(tmp_path, monkeypatch, per_laye
         for layer, rows in enumerate(banks.sources[name]):
             assert rows.dtype is torch.uint8
             torch.testing.assert_close(rows, value[layer], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("include_vision", [False, True])
+def test_ftw_text_only_filters_native_and_qwen_vision_weights(tmp_path, include_vision):
+    from freetoken.checkpoint.ftw import FTWWriter
+    from freetoken.models.weight import load_weight
+
+    vision_keys = ("vision.blocks.0.norm1.weight", "aligner.mlp.0.weight",
+                   "image_start", "image_end", "image_newline", "visual.blocks.0.norm1.weight")
+    text_keys = ("embed.weight", "layers.0.attn.wq_a.weight", "head.weight")
+    weights = {name: torch.full((2, 3), float(i), dtype=torch.bfloat16)
+               for i, name in enumerate((*vision_keys, *text_keys))}
+    writer = FTWWriter(str(tmp_path), shard_limit=8192)
+    for name, value in weights.items():
+        writer.add_tensor(name, value)
+    writer.finalize({})
+
+    actual = dict(load_weight(str(tmp_path), torch.device("cpu"), include_vision=include_vision))
+    assert set(actual) == set(weights if include_vision else text_keys)
+    for name, value in actual.items():
+        torch.testing.assert_close(value, weights[name], rtol=0, atol=0)

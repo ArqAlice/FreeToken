@@ -73,6 +73,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
     media: List[Dict[str, Any]] | None = None
+    images: List[bytes] | None = None
 
 
 @dataclass

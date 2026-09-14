@@ -73,8 +73,8 @@ def test_responses_preserves_image_between_text_parts():
         ]},
     ]})
     content = RP.convert_responses_to_genspec(req, {}).messages[0]["content"]
-    assert [p["type"] for p in content] == ["text", "image_url", "text"]
-    assert content[1]["image_url"]["url"] == "https://example.com/p.png"
+    assert [p["type"] for p in content] == ["text", "image", "text"]
+    assert content[1]["freetoken_ref"] == {"kind": "url", "data": "https://example.com/p.png"}
 
 
 def test_convert_defaults_max_output_tokens_when_omitted():
@@ -116,12 +116,13 @@ def test_convert_list_input_with_tool_roundtrip_and_tools():
 def test_function_output_preserves_ordered_images_and_text():
     output = [
         {"type": "input_text", "text": "first image"},
-        {"type": "input_image", "image_url": "https://example.com/first.png"},
+        {"type": "input_image", "image_url": "data:image/png;base64,Zmlyc3Q="},
         {"type": "input_text", "text": "second image"},
         {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
         {"type": "input_text", "text": "compare them"},
     ]
     fake = FakeState([("same", True, 5, 1)])
+    fake.config.served_modalities = frozenset({"image"})
     response = _client(fake).post("/v1/responses", json={"model": "deepseek-v41", "input": [
         {"type": "function_call", "call_id": "call_image", "name": "inspect", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "call_image", "output": output},
@@ -131,12 +132,13 @@ def test_function_output_preserves_ordered_images_and_text():
     assert tool == {
         "role": "tool", "tool_call_id": "call_image", "content": [
             {"type": "text", "text": "first image"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/first.png"}},
+            {"type": "image"},
             {"type": "text", "text": "second image"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+            {"type": "image"},
             {"type": "text", "text": "compare them"},
         ],
     }
+    assert fake.last_sent.images == [b"first", b"image"]
 
 
 @pytest.mark.parametrize("output", [
@@ -384,6 +386,7 @@ class FakeState:
         self._cached_tokens = cached_tokens  # stamped on the first ack (admission reply)
         self.maintenance_state = "serving"
         self.config = SimpleNamespace(
+            mm=SimpleNamespace(text_model_only=False, disabled_encoders=frozenset()),
             reasoning_parser=None, tool_call_parser="llama3",
             served_model_name="test-model", model_path="/test",
         )

@@ -258,9 +258,8 @@ def create_kvcache_pool(
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
             layer_ids=spec.layer_ids,
-            # Quantizes the KV tiers only -- the compressed index slab the score kernel
-            # reads stays the engine dtype (kvcache/qsa_pool.py).
             kv_quant=kv_quant,
+            mrope=model_config.model_is_mrope,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:

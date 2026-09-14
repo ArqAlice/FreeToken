@@ -41,8 +41,10 @@ Full-checkpoint long-context throughput and memory limits still need measurement
 ## Direct launch
 
 After [installing FreeToken](install.md), run this command with a downloaded
-snapshot or standalone FTW directory. It expresses the model settings used in
-the packed KV validation below without requiring a container configuration:
+snapshot or standalone FTW directory. The current default streams vision blocks
+from host memory (`--mm-encoder-weights host`). Historical validation below used
+resident vision weights, so its GPU allocation measurements do not describe this
+default placement:
 
 ```bash
 ft serve --model /path/to/snapshot \
@@ -86,17 +88,20 @@ ft serve --model /path/to/snapshot \
   --max-prefill-length 1024 --max-running-requests 2
 ```
 
-Resident model parameters, including vision, occupy 11.35 GiB. The BF16 KV pool
-for 1,048,576 tokens requires 3.94 GiB at a window ratio of 0.02; the default 0.2
+Historical validation with GPU-resident vision weights measured 11.35 GiB of
+resident model parameters. The current default streams vision blocks from host
+memory through two GPU buffers, so its resident allocation differs. The BF16 KV
+pool for 1,048,576 tokens requires 3.94 GiB at a window ratio of 0.02; the default 0.2
 ratio requires 11.17 GiB. A ratio of 0.01 reduces KV storage to 3.54 GiB. These
 ratios control retained window pages and prefix reuse, while the model's attention
 window remains 128 tokens.
 
 One layer of 384 cached experts requires 7.13 GiB. Disabling prefill overlap permits
 this minimum; the automatic planner can assign additional expert slots from the
-measured free memory. With ratio 0.02, the minimum persistent model, expert and KV
-allocation is 22.42 GiB, plus about 24 MiB of GPU Engram staging for a 1,024-token
-chunk. Activations, CUDA workspaces and allocator overhead need additional memory.
+measured free memory. With the historical resident-vision layout and ratio 0.02,
+the minimum persistent model, expert and KV allocation is 22.42 GiB, plus about
+24 MiB of GPU Engram staging for a 1,024-token chunk. Activations, CUDA workspaces
+and allocator overhead need additional memory.
 The two-buffer overlap path requires at least 768 expert slots and may exceed
 the default memory budget at this context length.
 
@@ -132,10 +137,26 @@ print(response.choices[0].message.content)
 ```
 
 Image spans include start, newline and end tokens and may cross prefill chunk
-boundaries. Each image is encoded once per request. Image requests do not share
-prefix-cache entries, because identical placeholder IDs can represent different
-images. Current input limits are 16 images per request, 32 MiB per image and
-64 megapixels per image.
+boundaries. The shared multimodal path hashes the processed patches, grid and
+span layout into image-specific placeholder IDs, allowing matching image
+prefixes to reuse the prefix cache. Repeated images share encoded embeddings
+while those embeddings are needed by active requests; a complete prefix hit can
+skip image encoding. Legacy `media` and precomputed `mm_embeds` requests remain
+isolated from prefix reuse. Current input limits are 16 images per request,
+32 MiB per image and 64 megapixels per image.
+
+The native chat encoder also preserves ordered text and images in Anthropic
+`tool_result` blocks and Responses `function_call_output`. Image support is
+enabled by default; `--text-model-only` or `--mm-disable vision` disables the
+tower and rejects image inputs. Vision block weights use host streaming by
+default; select `--mm-encoder-weights gpu` to keep them resident.
+
+`--image-max-tokens` limits the entire image span, including start, row-newline
+and end tokens. `--image-min-tokens` is rejected; use
+`--mm-processor-kwargs '{"vision_min_pixels": 295936}'` to set the minimum pixel
+area before the maximum-token resize. The processor also accepts
+`vision_max_n_token` and `vision_max_wh_ratio`; `vision_max_n_token` overrides
+`--image-max-tokens` when both are supplied.
 
 ## Native FP8-FP4 KV storage
 

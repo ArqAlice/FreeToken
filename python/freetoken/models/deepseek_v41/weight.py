@@ -136,7 +136,7 @@ class _ShardReader:
         self.handles.clear()
 
 
-def iter_weights(model_path, device, *, include_moe_experts=True, include_non_moe=True):
+def iter_weights(model_path, device, *, include_moe_experts=True, include_non_moe=True, include_vision=True):
     if include_moe_experts:
         raise ValueError("DeepSeek-V4.1 NVFP4 experts require --moe-strategy offload")
     if not include_non_moe:
@@ -149,7 +149,7 @@ def iter_weights(model_path, device, *, include_moe_experts=True, include_non_mo
         for name in sorted(weight_map, key=lambda name: (weight_map[name], name)):
             if name.startswith("mtp.") or _EXPERT_PREFIX_RE.match(name) or _ENGRAM_TABLE_RE.match(name):
                 continue
-            if not args.vision_enabled and name.startswith(("vision.", "aligner.", "image_")):
+            if (not include_vision or not args.vision_enabled) and name.startswith(("vision.", "aligner.", "image_")):
                 continue
             if name.endswith(".attn.wo_a.scale"):
                 continue

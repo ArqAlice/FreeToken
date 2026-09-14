@@ -157,6 +157,8 @@ async def handle_responses(
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
         uid = await submit_generation(spec, state)
+    except GenerationError as exc:
+        return _error_response(400, str(exc), exc.code)
     except ValueError as exc:
         return _error_response(400, str(exc))
 
@@ -260,7 +262,7 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
         role = item.get("role", "user")
         if role == "developer":
             role = "system"
-        return [{"role": role, "content": _input_text(item.get("content"))}]
+        return [{"role": role, "content": _input_content(item.get("content"))}]
     if itype == "function_call":
         return [
             {
@@ -328,25 +330,36 @@ def _merge_assistant_run(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return merged
 
 
-def _input_text(content: Any) -> str | list[dict[str, Any]]:
+def _input_content(content: Any) -> str | list[dict[str, Any]]:
+    """Like _input_text, but keeps input_image parts as template-ready image parts."""
+    if not isinstance(content, list):
+        return _input_text(content)
+    parts: list[dict[str, Any]] = []
+    has_image = any(isinstance(p, dict) and p.get("type") == "input_image" for p in content)
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "input_image":
+            url = part.get("image_url") or part.get("url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not url:
+                # an input_image without a url (e.g. a file_id) is not servable; fail rather than answer text-only
+                raise ValueError("input_image without image_url is not supported")
+            parts.append({"type": "image", "freetoken_ref": {"kind": "url", "data": url}})
+            continue
+        if has_image:
+            if not isinstance(part, dict) or part.get("type") not in ("input_text", "output_text", "text"):
+                raise ValueError("image message content must contain supported typed parts")
+        parts.append({"type": "text", "text": _input_text([part])})
+    if not has_image:
+        return "".join(p["text"] for p in parts)
+    return parts
+
+
+def _input_text(content: Any) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
         return content
-    if any(isinstance(p, dict) and p.get("type") == "input_image" for p in content):
-        converted = []
-        for part in content:
-            if not isinstance(part, dict):
-                raise ValueError("image message content must contain typed parts")
-            if part.get("type") == "input_image":
-                if not part.get("image_url"):
-                    raise ValueError("input_image requires image_url; uploaded file IDs are not supported")
-                converted.append({"type": "image_url", "image_url": {"url": part["image_url"]}})
-            elif part.get("type") in ("input_text", "output_text", "text"):
-                converted.append({"type": "text", "text": part.get("text") or ""})
-            else:
-                raise ValueError(f"Unsupported image message content type: {part.get('type')}")
-        return converted
     parts: list[str] = []
     for part in content:
         if isinstance(part, dict):
@@ -371,7 +384,7 @@ def _tool_output(value: Any) -> str | list[dict[str, Any]]:
     if isinstance(value, list) and any(
         isinstance(part, dict) and part.get("type") == "input_image" for part in value
     ):
-        return _input_text(value)
+        return _input_content(value)
     return _stringify(value)
 
 

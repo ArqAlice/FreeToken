@@ -30,6 +30,7 @@ class FakeState:
         reasoning_parser: str | None = None,
     ) -> None:
         self.config = SimpleNamespace(
+            mm=SimpleNamespace(text_model_only=False, disabled_encoders=frozenset()),
             model_path="/models/unit-model",
             served_model_name="unit-model",
             tool_call_parser=tool_call_parser,
@@ -52,6 +53,7 @@ class FakeState:
 
 def test_openai_image_request_preserves_content_and_numeric_effort():
     state = FakeState([UserReply(uid=42, incremental_output="red", finished=True)])
+    state.config.served_modalities = frozenset({"image"})
     request = ChatCompletionRequest.model_validate({
         "model": "deepseek-v41", "reasoning_effort": 63,
         "messages": [{"role": "user", "content": [
@@ -61,7 +63,8 @@ def test_openai_image_request_preserves_content_and_numeric_effort():
     })
     result = run(handle_chat_completion(request, request=None, state=state, model_sampling={}))
     assert result["choices"][0]["message"]["content"] == "red"
-    assert state.sent.text[0]["content"][1]["type"] == "image_url"
+    assert state.sent.text[0]["content"][1] == {"type": "image"}
+    assert state.sent.images == [b"abc"]
     assert state.sent.chat_template_kwargs["reasoning_effort"] == 63
 
 

@@ -70,17 +70,72 @@ def test_dsv41_numeric_effort_and_image_span_survive_tokenization(tmp_path):
         {"type": "text", "text": "What is this?"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()}},
     ]}], sampling_params=SamplingParams(), chat_template_kwargs={"enable_thinking": True, "reasoning_effort": 63})
-    [ids] = manager.tokenize([msg])
+    [wire] = manager.tokenize([msg])
+    ids = wire.input_ids
     assert "Reasoning Effort: 63" in tokenizer.prompt
     assert len(msg.media) == 1
     item = msg.media[0]
     assert item["types"].tolist() == [0, 1, 1, 2, 3]
     assert ids[item["start"]:item["start"] + 5].tolist() == [9] * 5
-    wire = UserMsg(7, ids, msg.sampling_params, media=msg.media)
     received = BaseBackendMsg.decoder(wire.encoder())
     torch.testing.assert_close(received.media[0]["patches"], item["patches"])
     assert received.media[0]["patches"].shape == (8, 3, 2, 2)
     assert received.media[0]["start"] == item["start"]
+
+
+def test_dsv41_main_mm_wire_keeps_reordered_tool_images_aligned(tmp_path):
+    import base64
+    import io
+    from PIL import Image
+    from freetoken.message import BaseBackendMsg, BaseTokenizerMsg
+    from freetoken.mm.config import MultimodalConfig
+    from freetoken.mm.media import collect_image_refs
+    from freetoken.models.deepseek_v41.mm_processor import DeepseekV41MMProcessor
+    from freetoken.server.generation import render_messages
+    from freetoken.utils.hf import RawConfigShim
+
+    def png(color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 4), color).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    red, blue = png("red"), png("blue")
+    tokenizer = FakeDsv41Tokenizer(tmp_path)
+    hf = RawConfigShim(json.loads((tmp_path / "config.json").read_text()))
+    processor = DeepseekV41MMProcessor(hf, str(tmp_path), MultimodalConfig())
+    manager = TokenizeManager(tokenizer, processor)
+    messages = [{"role": "assistant", "tool_calls": [
+        {"id": name, "type": "function", "function": {"name": "capture", "arguments": "{}"}}
+        for name in ("first", "second")
+    ]}]
+    for name, image in (("second", blue), ("first", red)):
+        messages.append({"role": "tool", "tool_call_id": name, "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(image).decode()}},
+        ]})
+    messages = render_messages(messages)
+    msg = TokenizeMsg(7, messages, SamplingParams(), {"enable_thinking": True, "reasoning_effort": 63})
+    assert "Reasoning Effort: 63" in manager.render_prompt(msg)
+    refs = collect_image_refs(messages)
+    assert len(refs) == 2
+    msg.images = [blue, red]
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    result, = manager.tokenize([decoded])
+    received = BaseBackendMsg.decoder(result.encoder())
+    assert received.media is None and received.mm_embeds is None
+    assert received.mrope_positions is None and received.mrope_delta == 0
+    assert len(received.mm_items) == 2
+    first, second = received.mm_items
+    assert first.hash != second.hash and first.pad_value != second.pad_value
+    assert first.feature[:, 0].mean() > second.feature[:, 0].mean()
+    for item in received.mm_items:
+        assert item.feature.dtype == torch.bfloat16 and item.feature.device.type == "cpu"
+        assert item.types == [0, 1, 1, 2, 3]
+        assert item.feature.shape == (8, 3, 2, 2)
+        start, end = item.offsets[0]
+        assert received.input_ids[start:end].tolist() == [item.pad_value] * 5
+    assert decoded.text == messages
+    with pytest.raises(ValueError, match="image parts"):
+        manager.tokenize([TokenizeMsg(8, messages, SamplingParams(), images=[red])])
 
 
 def test_dsv41_effort_range_is_validated(tmp_path):
@@ -127,7 +182,7 @@ def test_tokenize_manager_passes_chat_template_kwargs():
         chat_template_kwargs={"enable_thinking": True},
     )
 
-    [input_ids] = manager.tokenize([msg])
+    input_ids = manager.tokenize([msg])[0].input_ids
 
     assert tokenizer.chat_template_kwargs == {
         "tokenize": False,
@@ -154,7 +209,7 @@ def test_tokenize_manager_passes_tools_to_chat_template():
         tools=tools,
     )
 
-    [input_ids] = manager.tokenize([msg])
+    input_ids = manager.tokenize([msg])[0].input_ids
 
     assert tokenizer.chat_template_kwargs == {
         "tokenize": False,
@@ -210,7 +265,7 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
         tools=tools,
     )
 
-    [input_ids] = manager.tokenize([msg])
+    input_ids = manager.tokenize([msg])[0].input_ids
 
     assert tokenizer.prompt == "dsv4 prompt"
     assert input_ids.tolist() == [4, 5, 6]
@@ -253,7 +308,7 @@ def encode_messages(messages, thinking_mode, reasoning_effort=None):
     ]
     msg = TokenizeMsg(uid=1, text=messages, sampling_params=SamplingParams())
 
-    [input_ids] = manager.tokenize([msg])
+    input_ids = manager.tokenize([msg])[0].input_ids
 
     assert tokenizer.prompt == "dsv4 prompt"
     assert input_ids.tolist() == [4, 5, 6]

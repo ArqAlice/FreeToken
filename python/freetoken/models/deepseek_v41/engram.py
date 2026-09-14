@@ -84,6 +84,7 @@ def hash_token_run(ids: np.ndarray, image_mask: np.ndarray, token_map: np.ndarra
     image_mask = np.asarray(image_mask, dtype=bool)
     if ids.ndim != 1 or image_mask.shape != ids.shape or not 0 <= prefix_length <= len(ids):
         raise ValueError("invalid Engram token run")
+    ids = np.where(image_mask, pad_id, ids)
     if np.any(ids < 0) or np.any(ids >= len(token_map)):
         raise ValueError("Engram input token is outside the tokenizer vocabulary")
     compressed = token_map[ids]
@@ -251,9 +252,12 @@ class Engram(nn.Module):
 
 def _image_flags(req, start: int, length: int) -> np.ndarray:
     flags = np.zeros(length, dtype=bool)
+    spans = [span for item in getattr(req, "mm_items", None) or () for span in item.offsets]
     for media in getattr(req, "media", None) or ():
-        left = max(start, int(media["start"]))
-        right = min(start + length, int(media["start"]) + len(media["types"]))
+        spans.append((int(media["start"]), int(media["start"]) + len(media["types"])))
+    for lo, hi in spans:
+        left = max(start, lo)
+        right = min(start + length, hi)
         if left < right:
             flags[left-start:right-start] = True
     return flags

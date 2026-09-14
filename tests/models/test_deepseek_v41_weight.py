@@ -109,20 +109,27 @@ def test_bad_expert_headers_fail_before_allocation(tiny_shards, mutation, match)
         weight.validate_expert_headers(headers, config)
 
 
-def test_resident_loader_preserves_native_keys_and_excludes_external_tables(tiny_shards):
+@pytest.mark.parametrize("include_vision", [False, True])
+def test_resident_loader_preserves_native_keys_and_excludes_external_tables(tiny_shards, include_vision):
     folder, _ = tiny_shards
     config = {"n_layers": 1, "compress_ratios": [0], "kv_source_layers": [],
               "index_source_layers": [], "candidate_source_layer": -1,
-              "engram_layer_ids": [], "engram_num_embeddings": []}
+              "engram_layer_ids": [], "engram_num_embeddings": [], "vision_n_layers": 1}
     (folder / "config.json").write_text(json.dumps(config))
     tensors = {"head.weight": torch.arange(1024).view(32, 32).to(torch.bfloat16),
                "layers.0.attn.wo_a.weight": torch.ones(32, 32).to(torch.float8_e4m3fn),
-               "layers.0.attn.wo_a.scale": torch.tensor([[128]], dtype=torch.uint8).view(torch.float8_e8m0fnu)}
+               "layers.0.attn.wo_a.scale": torch.tensor([[128]], dtype=torch.uint8).view(torch.float8_e8m0fnu),
+               "vision.patch_embed.proj.weight": torch.ones(2, 3, dtype=torch.bfloat16),
+               "aligner.w1.weight": torch.ones(2, 3, dtype=torch.bfloat16),
+               "image_start": torch.ones(32, dtype=torch.bfloat16)}
     safetensors.torch.save_file(tensors, folder / "resident.safetensors")
     index = weight._weight_map(folder)
     index.update({name: "resident.safetensors" for name in tensors})
     (folder / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
-    resident = dict(weight.iter_weights(str(folder), "cpu", include_moe_experts=False))
-    assert set(resident) == {"head.weight", "layers.0.attn.wo_a"}
+    resident = dict(weight.iter_weights(str(folder), "cpu", include_moe_experts=False, include_vision=include_vision))
+    expected = {"head.weight", "layers.0.attn.wo_a"}
+    if include_vision:
+        expected |= {"vision.patch_embed.proj.weight", "aligner.w1.weight", "image_start"}
+    assert set(resident) == expected
     assert torch.all(resident["layers.0.attn.wo_a"] == 2)
     assert torch.equal(resident["head.weight"], tensors["head.weight"])

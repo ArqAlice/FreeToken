@@ -187,6 +187,8 @@ def load_args(config_or_path: Any, **overrides) -> DeepseekV41Args:
     for src, dst in _VISION_NAMES.items():
         if src in as_dict(raw.get("vision_config")):
             kwargs[dst] = as_dict(raw["vision_config"])[src]
+    if "vision_config" in raw and raw["vision_config"] is None:
+        kwargs["vision_n_layers"] = 0
     if "image_token_id" in raw:
         kwargs["image_token_id"] = raw["image_token_id"]
     quant = as_dict(raw.get("quantization_config"))

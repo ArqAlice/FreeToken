@@ -140,3 +140,99 @@ def test_vision_parameters_preserve_checkpoint_dtypes():
     for name, parameter in vision.named_parameters():
         assert parameter.dtype == (torch.float32 if "norm" in name else torch.bfloat16)
     assert all(p.dtype == torch.bfloat16 for p in aligner.parameters())
+
+
+def _processor():
+    from freetoken.mm.config import MultimodalConfig
+    from freetoken.models.deepseek_v41.mm_processor import DeepseekV41MMProcessor
+
+    config = {"image_token_id": 99, "vision_config": {
+        "num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2,
+        "intermediate_size": 12, "patch_size": 2, "downsample_ratio": 2,
+        "min_pixels": 16, "max_image_tokens": 24,
+    }}
+    return DeepseekV41MMProcessor(config, "unused", MultimodalConfig())
+
+
+def test_native_media_and_shared_processor_produce_identical_content_keys():
+    from freetoken.models.deepseek_v41.image_processor import ImageInput
+
+    processor = _processor()
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 4), (255, 0, 0)).save(buffer, format="PNG")
+    raw = buffer.getvalue()
+    result = processor.apply(torch.tensor([11, 99, 12], dtype=torch.int32), [raw])
+    patches, nh, nw, lh, lw = load_image({"data": raw}, processor.args)
+    types = image_token_types(lh, lw)
+    legacy_ids = torch.tensor([11] + [99] * len(types) + [12], dtype=torch.int32)
+    converted = processor.from_media(legacy_ids, [ImageInput(1, patches, nh, nw, types)])
+    assert torch.equal(converted.input_ids, result.input_ids)
+    assert converted.mm_items[0].hash == result.mm_items[0].hash
+    assert torch.equal(converted.mm_items[0].feature, result.mm_items[0].feature)
+    assert result.mm_items[0].offsets == [[1, 6]]
+    assert result.mm_items[0].types == types.tolist()
+    assert result.mrope_positions is None and result.mrope_delta == 0
+    changed_grid = processor._item(patches, nw, nh, types, 1)
+    assert changed_grid.hash != result.mm_items[0].hash
+    assert legacy_ids.tolist() == [11, 99, 99, 99, 99, 99, 12]
+
+
+def test_precomputed_mm_rows_scatter_with_image_router_mask():
+    hidden = torch.zeros(5, 3)
+    embeddings = torch.tensor([[1., 2., 3.], [4., 5., 6.]])
+    batch = SimpleNamespace(is_prefill=True, reqs=[SimpleNamespace()],
+                            mm_embeds=embeddings, mm_rows=torch.tensor([1, 3]))
+    actual, mask = merge_image_embeddings(None, batch, hidden)
+    torch.testing.assert_close(actual[[1, 3]], embeddings)
+    assert actual[[0, 2, 4]].count_nonzero() == 0
+    assert mask.tolist() == [False, True, False, True, False]
+
+
+def test_streamer_adapter_rebinds_native_parameters_without_changing_keys():
+    from freetoken.models.deepseek_v41.vision import _ModuleBlockAdapter
+    from freetoken.models.weight_stream import _slots
+
+    block = ViT(_args()).blocks[0]
+    names = set(block.state_dict())
+    adapter = _ModuleBlockAdapter(block)
+    slots, size = _slots(adapter)
+    row = torch.zeros(size, dtype=torch.uint8)
+    for slot in slots:
+        value = slot.view(row)
+        value.fill_(.25)
+        setattr(slot.owner, slot.attr, value)
+    assert set(block.state_dict()) == names
+    assert all(torch.all(p == .25) for p in block.parameters())
+    assert all(p.untyped_storage().data_ptr() == row.untyped_storage().data_ptr() for p in block.parameters())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_native_vision_host_streaming_matches_resident_across_repeated_images(monkeypatch):
+    torch.manual_seed(71)
+    vision = ViT(_args(vision_n_layers=3)).cuda().eval()
+    patches = [torch.randn(6, 3, 2, 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    expected = [vision(patch, 2, 3).clone() for patch in patches]
+    weights = {name: p.cpu().clone() for name, p in vision.named_parameters()}
+    vision.place_weights("host")
+    streamer = vision._streamer
+    assert streamer.bank.is_pinned() and streamer.staging.shape[0] == 2
+    assert all(p.device.type == "cpu" for block in vision.blocks for p in block.parameters())
+    assert vision.patch_embed.proj.weight.is_cuda
+    with monkeypatch.context() as mp:
+        def fail_block(*args):
+            raise RuntimeError("interrupted vision block")
+
+        mp.setattr(vision.blocks[1], "forward", fail_block)
+        with pytest.raises(RuntimeError, match="interrupted vision block"):
+            vision(patches[0], 2, 3)
+    assert all(p.device.type == "cpu" for block in vision.blocks for p in block.parameters())
+    for _ in range(2):
+        for patch, reference in zip(patches, expected):
+            torch.testing.assert_close(vision(patch, 2, 3), reference, rtol=0, atol=0)
+    assert all(p.device.type == "cpu" for block in vision.blocks for p in block.parameters())
+    for name, p in vision.named_parameters():
+        torch.testing.assert_close(p.cpu(), weights[name], rtol=0, atol=0)
+    vision.place_weights("gpu")
+    assert vision._streamer is None and all(p.is_cuda for p in vision.parameters())
+    torch.testing.assert_close(vision(patches[0], 2, 3), expected[0], rtol=0, atol=0)

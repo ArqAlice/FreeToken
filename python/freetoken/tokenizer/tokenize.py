@@ -5,12 +5,15 @@ import json
 import os
 import threading
 from types import ModuleType, SimpleNamespace
-from typing import Any, List
+from typing import TYPE_CHECKING, Any, List
 
 import torch
-from freetoken.message import TokenizeMsg
+from freetoken.message import TokenizeMsg, UserMsg
 from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from freetoken.mm.processor import MMProcessor
 
 from .effort import (
     EffortProfile,
@@ -47,8 +50,9 @@ _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None) -> None:
         self.tokenizer = tokenizer
+        self.mm_processor = mm_processor  # None: the model takes no images
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._dsv41 = bool(getattr(self._dsv4_encoder, "IS_DSV41", False))
         self._vision_args = _dsv41_vision_args(_load_dsv41_config(tokenizer)) if self._dsv41 else None
@@ -57,20 +61,31 @@ class TokenizeManager:
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
 
-    def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
+    def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
+        results: List[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
             if self._dsv41 and isinstance(msg.text, list):
                 from freetoken.models.deepseek_v41.image_processor import prepare_vl_inputs
 
                 prompt, payload = _apply_dsv4_chat_encoder(
-                    self._dsv4_encoder, msg.text, msg.tools,
+                    self._dsv4_encoder, _dsv41_image_sources(msg.text, msg.images), msg.tools,
                     self._sanitize_effort(msg.chat_template_kwargs or {}), return_media=True,
                 )
-                ids, _types, images = prepare_vl_inputs(prompt, payload["images"], self.tokenizer, self._vision_args)
-                msg.media = [vars(item) for item in images] if images else None
-                results.append(torch.tensor(ids, dtype=torch.int32))
+                args = self.mm_processor.args if self.mm_processor is not None else self._vision_args
+                ids, _types, images = prepare_vl_inputs(prompt, payload["images"], self.tokenizer, args)
+                input_ids = torch.tensor(ids, dtype=torch.int32)
+                if self.mm_processor is not None:
+                    mm = self.mm_processor.from_media(input_ids, images or [])
+                    results.append(UserMsg(
+                        uid=msg.uid, input_ids=mm.input_ids, sampling_params=msg.sampling_params,
+                        mm_items=mm.mm_items, mrope_positions=mm.mrope_positions, mrope_delta=mm.mrope_delta,
+                    ))
+                else:
+                    msg.media = [vars(item) for item in images] if images else None
+                    results.append(UserMsg(
+                        uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params, media=msg.media,
+                    ))
                 continue
             prompt = self.render_prompt(msg)
             # A jinja chat template owns every special token (HF's apply_chat_template
@@ -84,7 +99,25 @@ class TokenizeManager:
                     prompt, return_tensors="pt", add_special_tokens=not templated
                 )
             )
-            results.append(input_ids.view(-1).to(torch.int32))
+            input_ids = input_ids.view(-1).to(torch.int32)
+            if msg.images:
+                if self.mm_processor is None:
+                    raise ValueError("image input is not supported for this model")
+                mm = self.mm_processor.apply(input_ids, msg.images)
+                results.append(
+                    UserMsg(
+                        uid=msg.uid,
+                        input_ids=mm.input_ids,
+                        sampling_params=msg.sampling_params,
+                        mm_items=mm.mm_items,
+                        mrope_positions=mm.mrope_positions,
+                        mrope_delta=mm.mrope_delta,
+                    )
+                )
+            else:
+                results.append(
+                    UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params)
+                )
         return results
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
@@ -94,8 +127,9 @@ class TokenizeManager:
         validation, count_tokens) must quantize identically."""
         if not isinstance(msg.text, list):
             return msg.text
+        messages = _dsv41_image_sources(msg.text, msg.images) if self._dsv41 else msg.text
         return self._render(
-            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
+            messages, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
         )
 
     def _render(
@@ -106,7 +140,7 @@ class TokenizeManager:
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
         to actually reach the template so rejection is observable."""
-        if not self._dsv41 and _contains_images(messages):
+        if not self._dsv41 and self.mm_processor is None and _contains_images(messages):
             raise ValueError("this model does not support image content")
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(
@@ -194,6 +228,47 @@ def _contains_images(value) -> bool:
     if isinstance(value, list):
         return any(_contains_images(v) for v in value)
     return False
+
+
+def _dsv41_image_sources(messages: list[dict], images: list[bytes] | None) -> list[dict]:
+    """Bind image bytes before the native encoder reorders tool-result messages."""
+    image_index = 0
+
+    def blocks(content):
+        nonlocal image_index
+        if not isinstance(content, list):
+            return content
+        result = []
+        for block in content:
+            if not isinstance(block, dict):
+                result.append(block)
+                continue
+            part = dict(block)
+            if part.get("type") in ("image", "image_url"):
+                if images is not None:
+                    if image_index >= len(images):
+                        raise ValueError("image parts and supplied image bytes do not match")
+                    part = {"type": "image", "data": images[image_index]}
+                    image_index += 1
+                elif isinstance(part.get("freetoken_ref"), dict):
+                    ref = part["freetoken_ref"]
+                    key = "data" if ref.get("kind") == "b64" else "url"
+                    part = {"type": "image", key: ref.get("data")}
+            elif part.get("type") == "tool_result":
+                part["content"] = blocks(part.get("content"))
+            result.append(part)
+        return result
+
+    rendered = []
+    for message in messages:
+        item = dict(message)
+        for key in ("content", "content_blocks"):
+            if key in item:
+                item[key] = blocks(item[key])
+        rendered.append(item)
+    if images is not None and image_index != len(images):
+        raise ValueError("image parts and supplied image bytes do not match")
+    return rendered
 
 
 def _load_dsv41_config(tokenizer) -> dict | None:

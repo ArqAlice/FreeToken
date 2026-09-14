@@ -140,7 +140,10 @@ class Transformer(nn.Module):
         return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
 
     def prefill_batched(self, input_ids, segments, positions, last_indices, batch=None):
-        flat = self.embed(input_ids.flatten())
+        ids = input_ids.flatten()
+        if batch is not None and getattr(batch, "mm_embeds", None) is not None:
+            ids = ids.clamp(max=self.args.vocab_size - 1)
+        flat = self.embed(ids)
         image_mask = None
         if batch is not None and self.vision is not None:
             from .vision import merge_image_embeddings
@@ -185,6 +188,20 @@ class DeepseekV41ForCausalLM(BaseLLMModel):
 
     def mark_for_rebind(self):
         self._bound = False
+
+    def place_encoder_weights(self, mode):
+        if self._transformer.vision is not None:
+            self._transformer.vision.place_weights(mode)
+
+    def encode(self, item):
+        if item.modality != "image" or self._transformer.vision is None:
+            raise ValueError("DeepSeek-V4.1 supports image items only when vision is enabled")
+        from .vision import image_span_embeddings
+
+        embeddings = image_span_embeddings(self._transformer, item.feature, item.n_vit_h, item.n_vit_w, item.types)
+        if embeddings.shape[0] != item.num_tokens:
+            raise ValueError("DeepSeek-V4.1 image embedding count does not match its offsets")
+        return embeddings
 
     def _iter_offload_moe_layers(self):
         for layer in self._transformer.layers:

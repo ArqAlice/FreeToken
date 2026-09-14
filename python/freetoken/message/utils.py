@@ -16,7 +16,6 @@ _TENSOR_DTYPES = {str(dtype): dtype for dtype in (
     torch.float16, torch.bfloat16, torch.float32, torch.float64,
 )}
 
-
 def _serialize_any(value: Any) -> Any:
     if isinstance(value, dict):
         encoded = {k: _serialize_any(v) for k, v in value.items()}
@@ -41,7 +40,9 @@ def serialize_type(self) -> Dict:
         serialized["__type__"] = "Tensor"
         serialized["buffer"] = self.detach().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
         serialized["dtype"] = str(self.dtype)
-        serialized["shape"] = list(self.shape)
+        # Keep the original 1-D wire format readable by older workers.
+        if self.dim() != 1:
+            serialized["shape"] = list(self.shape)
         return serialized
 
     # normal type

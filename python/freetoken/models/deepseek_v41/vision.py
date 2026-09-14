@@ -6,6 +6,29 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from freetoken.layers import BaseOP
+
+
+class _ModuleBlockAdapter(BaseOP):
+    """Expose native module parameters to the shared block streamer's tensor slots."""
+
+    def __init__(self, module):
+        self._module = module
+        for name, parameter in module.named_parameters(recurse=False):
+            setattr(self, name, parameter)
+        for name, child in module.named_children():
+            setattr(self, name, _ModuleBlockAdapter(child))
+
+    def __setattr__(self, name, value):
+        module = self.__dict__.get("_module")
+        if module is not None and name in module._parameters:
+            value = value if isinstance(value, nn.Parameter) else nn.Parameter(value, requires_grad=False)
+            setattr(module, name, value)
+        object.__setattr__(self, name, value)
+
+    def forward(self, *args):
+        return self._module(*args)
+
 
 @lru_cache(8)
 def get_vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float):
@@ -100,6 +123,21 @@ class ViT(nn.Module):
         self.patch_embed = PatchEmbed(args)
         self.blocks = nn.ModuleList([Block(args) for _ in range(args.vision_n_layers)])
         self.norm = RMSNorm(args.vision_dim)
+        self._streamer = None
+        self._stream_blocks = None
+
+    def place_weights(self, mode):
+        if mode not in {"host", "gpu"}:
+            raise ValueError(f"Unsupported vision weight placement: {mode}")
+        if mode == "gpu" and self._streamer is not None:
+            self._streamer.unstream()
+            self._streamer, self._stream_blocks = None, None
+        elif mode == "host" and self._streamer is None and self.blocks:
+            from freetoken.models.weight_stream import BlockWeightStreamer
+
+            device = self.patch_embed.proj.weight.device
+            self._stream_blocks = [_ModuleBlockAdapter(block) for block in self.blocks]
+            self._streamer = BlockWeightStreamer(self._stream_blocks, device)
 
     def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
         if patches.shape[0] != n_h * n_w:
@@ -107,8 +145,14 @@ class ViT(nn.Module):
         x = self.patch_embed(patches)
         cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
         cos, sin = cos.to(x.device), sin.to(x.device)
-        for block in self.blocks:
-            x = block(x, cos, sin)
+        blocks = (self._streamer.blocks(self._stream_blocks) if self._streamer is not None
+                  else enumerate(self.blocks))
+        try:
+            for _, block in blocks:
+                x = block.forward(x, cos, sin)
+        finally:
+            if self._streamer is not None:
+                blocks.close()
         return self.norm(x)
 
 
@@ -129,17 +173,46 @@ class Aligner(nn.Module):
 
 
 @torch.inference_mode()
-def merge_image_embeddings(transformer, batch, hidden: torch.Tensor):
-    """Scatter request image spans into a flat, possibly chunked, prefill batch."""
-    if not batch.is_prefill or not any(getattr(req, "media", None) for req in batch.reqs):
-        return hidden, None
+def image_span_embeddings(transformer, patches, n_h, n_w, types):
+    """Encode the full native span, including learned image delimiters and row separators."""
     from .image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
 
+    weight = transformer.vision.patch_embed.proj.weight
+    types = torch.as_tensor(types, device=weight.device, dtype=torch.int64)
+    if types.ndim != 1 or torch.any((types < IMAGE_START) | (types > IMAGE_END)):
+        raise ValueError("invalid DeepSeek-V4.1 image token types")
+    features = transformer.encode_image(patches.to(device=weight.device, dtype=weight.dtype), n_h, n_w)
+    if features.shape != (int((types == IMAGE).sum()), transformer.image_start.numel()):
+        raise ValueError("vision aligner output does not match image token span")
+    span = torch.empty((types.numel(), features.shape[-1]), device=weight.device, dtype=features.dtype)
+    span[types == IMAGE] = features
+    for kind, name in ((IMAGE_START, "image_start"), (IMAGE_NEW_LINE, "image_newline"), (IMAGE_END, "image_end")):
+        span[types == kind] = getattr(transformer, name).to(features.dtype)
+    return span
+
+
+@torch.inference_mode()
+def merge_image_embeddings(transformer, batch, hidden: torch.Tensor):
+    """Scatter canonical embedding rows and compatible native media into a prefill chunk."""
+    if not batch.is_prefill:
+        return hidden, None
+    embeds = getattr(batch, "mm_embeds", None)
+    legacy = any(getattr(req, "media", None) for req in batch.reqs)
+    if embeds is None and not legacy:
+        return hidden, None
     mask = torch.zeros(hidden.shape[0], dtype=torch.bool, device=hidden.device)
+    if embeds is not None:
+        rows = batch.mm_rows
+        if embeds.shape != (rows.numel(), hidden.shape[-1]):
+            raise ValueError("DeepSeek-V4.1 multimodal embeddings have incompatible shape")
+        hidden.index_copy_(0, rows, embeds.to(device=hidden.device, dtype=hidden.dtype))
+        mask[rows] = True
+    if not legacy:
+        return hidden, mask
     offset = 0
     for req in batch.reqs:
         begin, end = req.cached_len, req.cached_len + req.extend_len
-        for item in req.media or ():
+        for item in getattr(req, "media", None) or ():
             start = item["start"]
             types = item["types"]
             stop = start + types.numel()
@@ -147,17 +220,7 @@ def merge_image_embeddings(transformer, batch, hidden: torch.Tensor):
             if left >= right:
                 continue
             if "embeddings" not in item:
-                patches = item["patches"].to(
-                    device=hidden.device, dtype=transformer.vision.patch_embed.proj.weight.dtype
-                )
-                features = transformer.encode_image(patches, item["n_vit_h"], item["n_vit_w"])
-                gpu_types = types.to(hidden.device)
-                if features.shape != (int((types == IMAGE).sum()), hidden.shape[-1]):
-                    raise ValueError("vision aligner output does not match image token span")
-                span = torch.empty((types.numel(), hidden.shape[-1]), device=hidden.device, dtype=hidden.dtype)
-                span[gpu_types == IMAGE] = features.to(hidden.dtype)
-                for kind, name in ((IMAGE_START, "image_start"), (IMAGE_NEW_LINE, "image_newline"), (IMAGE_END, "image_end")):
-                    span[gpu_types == kind] = getattr(transformer, name).to(hidden.dtype)
+                span = image_span_embeddings(transformer, item["patches"], item["n_vit_h"], item["n_vit_w"], types)
                 # The shared request object survives chunking; retain only the small CPU result.
                 item["embeddings"] = span.cpu()
                 item["patches"] = None
