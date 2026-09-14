@@ -257,3 +257,30 @@ def test_ftw_text_only_filters_native_and_qwen_vision_weights(tmp_path, include_
     assert set(actual) == set(weights if include_vision else text_keys)
     for name, value in actual.items():
         torch.testing.assert_close(value, weights[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("with_input_scale", [False, True])
+def test_ftw_activation_scale_follows_the_current_model_scheme(tmp_path, with_input_scale):
+    from freetoken.checkpoint.ftw import FTWWriter
+    from freetoken.engine.engine import _materialize_loaded_weight_state_dict
+    from freetoken.models.weight import load_weight
+
+    layer = torch.nn.Linear(3, 2, bias=False, dtype=torch.bfloat16)
+    layer.register_buffer("weight_scale", torch.empty((), dtype=torch.float32))
+    if with_input_scale:
+        layer.register_buffer("input_scale", torch.empty((), dtype=torch.float32))
+    model = torch.nn.ModuleDict({"linear": layer})
+    weights = {"linear.weight": torch.arange(6, dtype=torch.bfloat16).reshape(2, 3),
+               "linear.weight_scale": torch.tensor(0.25), "linear.input_scale": torch.tensor(0.5)}
+    writer = FTWWriter(str(tmp_path), shard_limit=8192)
+    for name, value in weights.items():
+        writer.add_tensor(name, value)
+    writer.finalize({})
+
+    loaded = _materialize_loaded_weight_state_dict(
+        model.state_dict(), load_weight(str(tmp_path), torch.device("cpu")), device=torch.device("cpu"),
+    )
+    model.load_state_dict(loaded, strict=True)
+    assert set(loaded) == set(model.state_dict())
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, weights[name], rtol=0, atol=0)

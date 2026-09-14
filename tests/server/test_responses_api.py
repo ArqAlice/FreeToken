@@ -113,7 +113,8 @@ def test_convert_list_input_with_tool_roundtrip_and_tools():
     assert spec.parse_tools
 
 
-def test_function_output_preserves_ordered_images_and_text():
+@pytest.mark.parametrize("model_cls", ["DeepseekV41ForCausalLM", "Qwen4ExpForCausalLM"])
+def test_function_output_preserves_ordered_images_and_text(model_cls):
     output = [
         {"type": "input_text", "text": "first image"},
         {"type": "input_image", "image_url": "data:image/png;base64,Zmlyc3Q="},
@@ -123,36 +124,43 @@ def test_function_output_preserves_ordered_images_and_text():
     ]
     fake = FakeState([("same", True, 5, 1)])
     fake.config.served_modalities = frozenset({"image"})
+    fake.config.model_spec = SimpleNamespace(model_cls=model_cls)
     response = _client(fake).post("/v1/responses", json={"model": "deepseek-v41", "input": [
         {"type": "function_call", "call_id": "call_image", "name": "inspect", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "call_image", "output": output},
     ]})
     assert response.status_code == 200, response.text
-    tool = fake.last_sent.text[-1]
-    assert tool == {
-        "role": "tool", "tool_call_id": "call_image", "content": [
-            {"type": "text", "text": "first image"},
-            {"type": "image"},
-            {"type": "text", "text": "second image"},
-            {"type": "image"},
-            {"type": "text", "text": "compare them"},
-        ],
-    }
+    if model_cls == "DeepseekV41ForCausalLM":
+        assert fake.last_sent.text[-1] == {
+            "role": "tool", "tool_call_id": "call_image", "content": [
+                {"type": "text", "text": "first image"},
+                {"type": "image"},
+                {"type": "text", "text": "second image"},
+                {"type": "image"},
+                {"type": "text", "text": "compare them"},
+            ],
+        }
+    else:
+        assert fake.last_sent.text[-2:] == [
+            {"role": "tool", "tool_call_id": "call_image", "content": "first imagesecond imagecompare them"},
+            {"role": "user", "content": [{"type": "image"}, {"type": "image"}]},
+        ]
     assert fake.last_sent.images == [b"first", b"image"]
 
 
 @pytest.mark.parametrize("output", [
     {"result": [1, 2], "text": "raw object"},
     [1, {"value": 2}, "three"],
-    [{"type": "input_text", "text": "text-only output retains JSON compatibility"}],
+    [{"type": "input_text", "text": "data"}, {"result": 2}],
     {"type": "input_image", "image_url": "https://example.com/data-field.png"},
     [],
 ])
-def test_function_output_preserves_non_media_json(output):
+@pytest.mark.parametrize("preserve_tool_images", [False, True])
+def test_function_output_preserves_non_media_json(output, preserve_tool_images):
     req = ResponsesRequest(model="m", input=[
         {"type": "function_call_output", "call_id": "call_1", "output": output},
     ])
-    message = RP.convert_responses_to_genspec(req, {}).messages[0]
+    message = RP.convert_responses_to_genspec(req, {}, preserve_tool_images=preserve_tool_images).messages[0]
     assert message["content"] == json.dumps(output)
 
 
@@ -165,6 +173,48 @@ def test_function_output_rejects_uploaded_image_file_ids():
     ]})
     assert response.status_code == 400
     assert "image_url" in response.json()["error"]["message"]
+
+
+def test_convert_function_call_output_image_moves_to_a_user_turn():
+    # codex's view_image returns the image as the tool output; templates render tool messages as text.
+    req = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-x",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "view_image", "arguments": '{"path": "a.png"}'},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        {"type": "input_text", "text": "viewed"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,aGk="},
+                    ],
+                },
+            ],
+        }
+    )
+    spec = RP.convert_responses_to_genspec(req, {})
+    assert [m["role"] for m in spec.messages] == ["user", "assistant", "tool", "user"]
+    assert spec.messages[2]["tool_call_id"] == "call_1" and spec.messages[2]["content"] == "viewed"
+    assert spec.messages[3]["content"] == [
+        {"type": "image", "freetoken_ref": {"kind": "url", "data": "data:image/png;base64,aGk="}}
+    ]
+
+
+@pytest.mark.parametrize("preserve_tool_images", [False, True])
+def test_image_only_function_output_keeps_call_id_and_image(preserve_tool_images):
+    req = ResponsesRequest(model="alias", input=[{
+        "type": "function_call_output", "call_id": "call_image", "output": [
+            {"type": "input_image", "image_url": "data:image/png;base64,aGk="},
+        ],
+    }])
+    messages = RP.convert_responses_to_genspec(req, {}, preserve_tool_images=preserve_tool_images).messages
+    image = {"type": "image", "freetoken_ref": {"kind": "url", "data": "data:image/png;base64,aGk="}}
+    assert messages[0] == {
+        "role": "tool", "tool_call_id": "call_image", "content": [image] if preserve_tool_images else "",
+    }
+    assert messages[1:] == ([] if preserve_tool_images else [{"role": "user", "content": [image]}])
 
 
 def test_convert_reasoning_item_merges_into_assistant_turn():
@@ -989,3 +1039,24 @@ def test_convert_reasoning_toggle_broadcasts_every_spelling():
         assert spec.chat_template_kwargs == {
             "enable_thinking": False, "thinking_mode": "disabled"
         }, parser
+
+
+@pytest.mark.parametrize("preserve_tool_images", [False, True])
+def test_convert_function_call_output_text_list_stays_a_plain_tool_message(preserve_tool_images):
+    req = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-x",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}],
+                },
+            ],
+        }
+    )
+    spec = RP.convert_responses_to_genspec(req, {}, preserve_tool_images=preserve_tool_images)
+    assert [m["role"] for m in spec.messages] == ["user", "assistant", "tool"]
+    assert spec.messages[2]["content"] == "ab"

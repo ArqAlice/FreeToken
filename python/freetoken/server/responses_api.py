@@ -155,6 +155,10 @@ async def handle_responses(
         spec = convert_responses_to_genspec(
             req, model_sampling, default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            preserve_tool_images=(
+                getattr(getattr(state.config, "model_spec", None), "model_cls", None)
+                == "DeepseekV41ForCausalLM"
+            ),
         )
         uid = await submit_generation(spec, state)
     except GenerationError as exc:
@@ -190,6 +194,7 @@ def convert_responses_to_genspec(
     model_sampling: dict[str, Any],
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     reasoning_parser: str | None = None,
+    preserve_tool_images: bool = False,
 ) -> GenSpec:
     # Collect every system/developer text — the top-level `instructions` PLUS any
     # system/developer-role input items (codex sends both: a system prompt as `instructions`
@@ -206,7 +211,7 @@ def convert_responses_to_genspec(
         other.append({"role": "user", "content": req.input})
     else:
         for item in req.input:
-            for m in _convert_input_item(item):
+            for m in _convert_input_item(item, preserve_tool_images=preserve_tool_images):
                 if m.get("role") == "system":
                     system_texts.append(m.get("content") or "")
                 else:
@@ -254,7 +259,7 @@ def convert_responses_to_genspec(
     )
 
 
-def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
+def _convert_input_item(item: dict[str, Any], *, preserve_tool_images: bool = False) -> list[dict[str, Any]]:
     itype = item.get("type", "message")
     if itype == "message" or ("role" in item and "type" not in item):
         # codex sends a "developer" role (Responses instructions). Chat templates only
@@ -280,13 +285,13 @@ def _convert_input_item(item: dict[str, Any]) -> list[dict[str, Any]]:
             }
         ]
     if itype == "function_call_output":
-        return [
-            {
-                "role": "tool",
-                "tool_call_id": item.get("call_id", ""),
-                "content": _tool_output(item.get("output")),
-            }
-        ]
+        content = _tool_output(item.get("output"))
+        tool_msg = {"role": "tool", "tool_call_id": item.get("call_id", ""), "content": content}
+        if isinstance(content, str) or preserve_tool_images:
+            return [tool_msg]
+        # Chat templates render tool messages as text, so the images ride on a user turn after the tool message (the Anthropic path does the same).
+        tool_msg["content"] = "".join(p["text"] for p in content if p["type"] == "text")
+        return [tool_msg, {"role": "user", "content": [p for p in content if p["type"] == "image"]}]
     if itype == "reasoning":
         # Folded into its assistant turn by _merge_assistant_run; summary-only /
         # encrypted items carry no recoverable text.
@@ -381,10 +386,10 @@ def _stringify(value: Any) -> str:
 
 
 def _tool_output(value: Any) -> str | list[dict[str, Any]]:
-    if isinstance(value, list) and any(
-        isinstance(part, dict) and part.get("type") == "input_image" for part in value
-    ):
-        return _input_content(value)
+    if isinstance(value, list):
+        types = [part.get("type") if isinstance(part, dict) else None for part in value]
+        if "input_image" in types or (types and all(t in ("input_text", "output_text", "text") for t in types)):
+            return _input_content(value)
     return _stringify(value)
 
 

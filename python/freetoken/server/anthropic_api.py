@@ -117,6 +117,10 @@ async def handle_anthropic_messages(
         spec = convert_anthropic_to_genspec(
             req, model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            preserve_tool_images=(
+                getattr(getattr(state.config, "model_spec", None), "model_cls", None)
+                == "DeepseekV41ForCausalLM"
+            ),
             default_max_tokens=(
                 getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
             ),
@@ -153,7 +157,11 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
     # so it must not fall into the convert/empty-prompt ValueError branch.
     try:
         messages, template_tools, _, ctk = convert_anthropic_prompt(
-            req, reasoning_parser=getattr(state.config, "reasoning_parser", None)
+            req, reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            preserve_tool_images=(
+                getattr(getattr(state.config, "model_spec", None), "model_cls", None)
+                == "DeepseekV41ForCausalLM"
+            ),
         )
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
@@ -182,6 +190,7 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
 def convert_anthropic_prompt(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
     reasoning_parser: str | None = None,
+    preserve_tool_images: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
     """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
@@ -218,21 +227,7 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                src = block.source or {}
-                stype = src.get("type")
-                data = src.get("data") if stype == "base64" else src.get("url")
-                if not data:
-                    # an unsupported image source must fail the request, not degrade to a text-only answer
-                    raise ValueError(f"unsupported image source type: {stype!r}")
-                content_parts.append(
-                    {
-                        "type": "image",
-                        "freetoken_ref": {
-                            "kind": "b64" if stype == "base64" else "url",
-                            "data": data,
-                        },
-                    }
-                )
+                content_parts.append(_image_part(block.source))
                 continue
             elif block.type == "tool_use":
                 tool_calls.append(
@@ -246,21 +241,24 @@ def convert_anthropic_prompt(
                     }
                 )
             elif block.type == "tool_result":
+                content = _tool_result_content(block.content)
+                images = [p for p in content if p["type"] == "image"] if isinstance(content, list) else []
+                text = "".join(p["text"] for p in content if p["type"] == "text") if images else content
                 if msg.role == "user":
                     other.append(
                         {
                             "role": "tool",
                             "tool_call_id": block.tool_use_id or block.id or "",
-                            "content": _tool_result_content(block.content),
+                            "content": content if preserve_tool_images else text,
                         }
                     )
+                    # Templates with text-only tool messages need images on the following user turn.
+                    if not preserve_tool_images:
+                        content_parts.extend(images)
                 else:
-                    content_parts.append(
-                        {
-                            "type": "text",
-                            "text": f"Tool result: {_tool_result_text(block.content)}",
-                        }
-                    )
+                    if images:
+                        raise ValueError("images inside a tool_result are only accepted in a user message")
+                    content_parts.append({"type": "text", "text": f"Tool result: {text}"})
 
         openai_msg: dict[str, Any] = {"role": msg.role}
         if thinking_parts:
@@ -322,9 +320,10 @@ def convert_anthropic_to_genspec(
     model_sampling: dict[str, Any],
     reasoning_parser: str | None = None,
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    preserve_tool_images: bool = False,
 ) -> GenSpec:
     messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(
-        req, reasoning_parser=reasoning_parser
+        req, reasoning_parser=reasoning_parser, preserve_tool_images=preserve_tool_images
     )
     return GenSpec(
         messages=messages,
@@ -353,27 +352,37 @@ def _content_text(content) -> str:
     return "".join(b.text for b in content if getattr(b, "type", None) == "text" and b.text)
 
 
-def _tool_result_content(content):
-    if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "image" for p in content):
-        return [dict(p) for p in content if isinstance(p, dict) and p.get("type") in ("text", "image")]
-    return _tool_result_text(content)
+def _image_part(source: dict[str, Any] | None) -> dict[str, Any]:
+    src = source or {}
+    stype = src.get("type")
+    data = src.get("data") if stype == "base64" else src.get("url")
+    if not data:
+        # an unsupported image source must fail the request, not degrade to a text-only answer
+        raise ValueError(f"unsupported image source type: {stype!r}")
+    return {
+        "type": "image",
+        "freetoken_ref": {"kind": "b64" if stype == "base64" else "url", "data": data},
+    }
 
 
-def _tool_result_text(content) -> str:
+def _tool_result_content(content) -> str | list[dict[str, Any]]:
+    """Keep image-bearing tool results ordered for encoders that support them."""
     if content is None:
         return ""
     if isinstance(content, str):
         return content
-    parts: list[str] = []
+    parts: list[dict[str, Any]] = []
+    has_image = False
     for item in content:
         if isinstance(item, dict):
             if item.get("type") == "image":
-                # chat templates render tool messages as plain text, so an image here has nowhere to go
-                raise ValueError("images inside tool results are not supported")
-            parts.append(item.get("text") or "")
+                parts.append(_image_part(item.get("source")))
+                has_image = True
+            else:
+                parts.append({"type": "text", "text": item.get("text") or ""})
         else:
-            parts.append(str(item))
-    return "".join(parts)
+            parts.append({"type": "text", "text": str(item)})
+    return parts if has_image else "".join(p["text"] for p in parts)
 
 
 # --------------------------------------------------------------------------- #

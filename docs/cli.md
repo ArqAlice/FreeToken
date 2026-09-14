@@ -131,8 +131,11 @@ images is rejected otherwise. Images are accepted on all three protocols (OpenAI
 `image_url`, Anthropic `image` blocks, Responses `input_image`) as an http(s) URL
 or base64. Tool-result image support depends on the model's chat encoding:
 DeepSeek-V4.1 accepts ordered text and images inside Anthropic `tool_result`
-blocks and Responses `function_call_output`; Qwen VL chat templates render tool
-messages as plain text and do not support image tool results.
+blocks and Responses `function_call_output` without moving them. For Qwen VL and
+other chat templates that render tool messages as plain text, images are moved
+to a user turn after the tool message, as vLLM does. This supports tool images
+from Claude Code's Read and Codex's view_image while keeping the tool's text
+under its original call ID.
 `GET /v1/stats` reports what the server accepts as `model.input_modalities` (`["text"]` or `["text", "image"]`),
 so a client can gate its attachment controls without reading the checkpoint config.
 
@@ -189,6 +192,10 @@ Discovers the served model via `/v1/models`, writes the agent's provider
 config, installs the agent CLI if missing, then launches it. Cloud API keys
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are cleared from the child
 environment so the agent cannot silently fall back to a paid endpoint.
+When `/v1/stats` reports `image` among `model.input_modalities`, the written
+config declares the model image-capable, which Codex, OpenCode, OpenClaw and
+dsh require before their image tools and attachments send anything; Claude
+Code and Hermes need no declaration.
 
 | Flag | Meaning |
 |---|---|

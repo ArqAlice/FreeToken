@@ -311,23 +311,13 @@ def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
         return _load_attr(spec.module, spec.quant_config)(hf_config)
 
     from freetoken.layers.quantization import NameMap, QuantConfig
-    from freetoken.utils.hf import optional_hf_file
 
     if spec.parse_config == "parse_gguf_config":
         return None
-    # NOTE: ModelOpt exports before 0.41 keep the quantization config only in hf_quant_config.json, and the weight download fetches nothing but the safetensors shards, so this sidecar is fetched on its own.
-    hf_quant_config = None
-    sidecar = optional_hf_file(model_path, "hf_quant_config.json")
-    if sidecar is not None:
-        import json
-
-        with open(sidecar) as f:
-            hf_quant_config = json.load(f)
     return QuantConfig.from_hf(
         hf_config,
         name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
         unquantized=spec.unquantized_modules,
-        hf_quant_config=hf_quant_config,
     )
 
 

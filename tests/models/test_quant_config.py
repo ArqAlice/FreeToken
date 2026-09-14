@@ -43,6 +43,7 @@ from freetoken.layers.quantization.moe import Fp8BlockMoEMethod, Mxfp4MoEMethod,
 from freetoken.models import create_model
 from freetoken.models.gpt_oss.moe import GptOssMoELayer, GptOssOffloadMoELayer
 from freetoken.models.register import checkpoint_quant_config, get_model_spec
+from freetoken.utils.hf import sidecar_quantization_config
 from freetoken.utils.torch_utils import torch_dtype
 
 MODELS = "/mnt/nvme/models"
@@ -396,12 +397,16 @@ def test_probed_layers_get_the_method_their_config_says(case: Case, monkeypatch)
     "deepseek_v41_libertai_nvfp4_config.json",
 ])
 def test_dsv41_factory_preserves_native_quantization(filename, tmp_path, monkeypatch):
+    from freetoken.utils import cached_load_hf_config
+
     def unexpected_sidecar(*args, **kwargs):
         pytest.fail("V4.1 native quantization must not use the generic sidecar dialect")
 
     monkeypatch.setattr("freetoken.utils.hf.optional_hf_file", unexpected_sidecar)
     raw = json.loads((Path(__file__).parent / "fixtures" / filename).read_text())
-    quant = checkpoint_quant_config(str(tmp_path), raw, get_model_spec(raw["architectures"][0]))
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    hf = cached_load_hf_config(str(tmp_path))
+    quant = checkpoint_quant_config(str(tmp_path), hf, get_model_spec(raw["architectures"][0]))
     dense = quant.scheme_for("layers.2.attn.wq_a")
     assert dense.kind is QuantKind.FP8_BLOCK
     assert dense.weight.group == (32, 32)
@@ -423,24 +428,72 @@ def test_generic_fp8_factory_still_rejects_32_by_32_blocks(tmp_path):
         checkpoint_quant_config(str(tmp_path), raw, get_model_spec("Qwen3MoeForCausalLM"))
 
 
-def test_hub_ids_fetch_the_modelopt_sidecar(tmp_path, monkeypatch):
-    """An old ModelOpt export keeps its quantization config only in hf_quant_config.json."""
-    from huggingface_hub.utils import EntryNotFoundError
+def test_the_modelopt_sidecar_is_folded_into_the_hf_config(tmp_path):
+    """An old ModelOpt export keeps its quantization config only in hf_quant_config.json; the config loader folds it in, so every reader of the config sees it."""
+    from freetoken.utils import cached_load_hf_config
 
-    sidecar = tmp_path / "hf_quant_config.json"
-    sidecar.write_text(json.dumps({"producer": {"name": "modelopt", "version": "0.29.0"}, "quantization": {"quant_algo": "FP8", "exclude_modules": ["lm_head"]}}))
-
-    def fake_download(repo_id, filename, **_):
-        assert repo_id == "org/old-modelopt-fp8"
-        if filename == "hf_quant_config.json":
-            return str(sidecar)
-        raise EntryNotFoundError(f"no {filename}")
-
-    monkeypatch.setattr("freetoken.utils.hf.hf_hub_download", fake_download)
-    quant = checkpoint_quant_config("org/old-modelopt-fp8", SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]), get_model_spec("Qwen3MoeForCausalLM"))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_moe", "architectures": ["Qwen3MoeForCausalLM"]}))
+    (tmp_path / "hf_quant_config.json").write_text(json.dumps({"producer": {"name": "modelopt", "version": "0.29.0"}, "quantization": {"quant_algo": "FP8", "exclude_modules": ["lm_head"]}}))
+    hf = cached_load_hf_config(str(tmp_path))
+    assert hf.quantization_config == {"quant_method": "modelopt", "quant_algo": "FP8", "exclude_modules": ["lm_head"]}
+    quant = checkpoint_quant_config(str(tmp_path), hf, get_model_spec("Qwen3MoeForCausalLM"))
     assert type(quant) is ModelOptConfig
     assert quant.scheme_for("model.layers.0.self_attn.q_proj").kind is QuantKind.FP8_TENSOR
     assert quant.scheme_for("lm_head") is None
+
+
+def test_hub_sidecar_reaches_all_config_readers_and_cached_copies(tmp_path, monkeypatch):
+    from freetoken.layers.quantization.configs.base import quantization_config_of
+    from freetoken.utils.hf import AutoConfig, RawConfigShim, _load_hf_config, cached_load_hf_config
+
+    path = "org/old-modelopt-no-input"
+    quant = {"quant_algo": "FP8", "with_input_scale": False, "exclude_modules": ["lm_head"]}
+    sidecar = tmp_path / "hf_quant_config.json"
+    sidecar.write_text(json.dumps({"quantization": quant}))
+    downloads = []
+
+    def download(repo_id, filename, **kwargs):
+        assert (repo_id, filename) == (path, "hf_quant_config.json")
+        downloads.append(filename)
+        return str(sidecar)
+
+    monkeypatch.setattr("freetoken.utils.hf.hf_hub_download", download)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda *args, **kwargs: RawConfigShim({
+        "architectures": ["Qwen3MoeForCausalLM"], "model_type": "unknown_export",
+    }))
+    _load_hf_config.cache_clear()
+    try:
+        hf = cached_load_hf_config(path)
+        assert quantization_config_of(hf) == {"quant_method": "modelopt", **quant}
+        direct = QuantConfig.from_hf(hf)
+        registered = checkpoint_quant_config(path, hf, get_model_spec(hf.architectures[0]))
+        for config in (direct, registered):
+            scheme = config.scheme_for("model.layers.0.self_attn.q_proj")
+            assert scheme.kind is QuantKind.FP8_TENSOR and not scheme.has("input_scale")
+            assert config.scheme_for("lm_head") is None
+        hf._data["quantization_config"]["with_input_scale"] = True
+        assert quantization_config_of(cached_load_hf_config(path))["with_input_scale"] is False
+        assert downloads == ["hf_quant_config.json"]
+    finally:
+        _load_hf_config.cache_clear()
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["top-level", "text-config"])
+def test_inline_quantization_takes_precedence_without_fetching_sidecar(tmp_path, monkeypatch, nested):
+    from freetoken.utils import cached_load_hf_config
+
+    quant = {"quant_method": "modelopt", "quant_algo": "W4A16_NVFP4"}
+    raw = {"model_type": "unknown_export", "architectures": ["Qwen3MoeForCausalLM"]}
+    if nested:
+        raw["text_config"] = {"quantization_config": quant}
+    else:
+        raw["quantization_config"] = quant
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    monkeypatch.setattr("freetoken.utils.hf.optional_hf_file",
+                        lambda *args, **kwargs: pytest.fail("inline quantization must win before sidecar lookup"))
+    config = QuantConfig.from_hf(cached_load_hf_config(str(tmp_path)))
+    scheme = config.scheme_for("model.layers.0.mlp.down_proj")
+    assert scheme.kind is QuantKind.NVFP4 and not scheme.has("input_scale")
 
 
 def test_compressed_tensors_ignore_names_the_module_alone():
@@ -457,6 +510,23 @@ def test_compressed_tensors_ignore_names_the_module_alone():
     assert quant.scheme_for("model.language_model.layers.0.linear_attn.in_proj_qkv").kind is QuantKind.FP8_TENSOR
     assert quant.scheme_for("model.language_model.layers.0.linear_attn.in_proj_b") is None
     assert quant.scheme_for("model.language_model.layers.0.linear_attn") is None
+
+
+_NVFP4_GROUP = {"targets": ["Linear"], "weights": {"num_bits": 4, "type": "float", "group_size": 16}}
+
+
+@pytest.mark.parametrize("extra, has_input_scale", [
+    ({"config_groups": {"group_0": {**_NVFP4_GROUP, "input_activations": None}}}, False),
+    ({"config_groups": {"group_0": {**_NVFP4_GROUP, "input_activations": {"num_bits": 4, "type": "float", "group_size": 16}}}}, True),
+    ({}, True),
+    ({"with_input_scale": False}, False),
+    ({"config_groups": {"group_0": {**_NVFP4_GROUP, "input_activations": None}}, "with_input_scale": True}, True),
+], ids=["no input_activations", "input_activations", "no config_groups", "with_input_scale false", "with_input_scale true wins"])
+def test_modelopt_nvfp4_reads_the_activation_quantizer_from_config_groups(extra, has_input_scale):
+    """A ModelOpt export can say ``NVFP4`` with no activation quantizer: every config group then has ``input_activations`` null (vLLM #54427); an explicit ``with_input_scale`` wins."""
+    q = {"quant_method": "modelopt", "quant_algo": "NVFP4", **extra}
+    scheme = QuantConfig.from_hf(SimpleNamespace(quantization_config=q)).scheme_for("model.layers.0.mlp.down_proj")
+    assert scheme.kind is QuantKind.NVFP4 and scheme.has("input_scale") is has_input_scale
 
 
 def test_every_dialect_names_the_tensors_behind_its_schemes():
@@ -602,13 +672,14 @@ def test_scheme_for_agrees_with_the_stored_tensors(ckpt: Path):
         with pytest.raises(NotImplementedError):
             QuantConfig.from_hf(cfg)
         return
-    hfq = json.load(open(ckpt / "hf_quant_config.json")) if (ckpt / "hf_quant_config.json").exists() else None
+    if not quant:
+        cfg["quantization_config"] = sidecar_quantization_config(str(ckpt))
     try:
         spec = get_model_spec((cfg.get("architectures") or [""])[0])
     except Exception:
         spec = None
     qc = (checkpoint_quant_config(str(ckpt), cfg, spec) if spec and spec.quant_config is not None
-          else QuantConfig.from_hf(cfg, hf_quant_config=hfq, unquantized=spec.unquantized_modules if spec else ()))
+          else QuantConfig.from_hf(cfg, unquantized=spec.unquantized_modules if spec else ()))
     weight_map = _weight_map(ckpt)
     tensors = _tensor_info(ckpt, weight_map)
     mismatches, checked = [], 0
