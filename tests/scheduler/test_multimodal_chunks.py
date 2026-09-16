@@ -99,13 +99,14 @@ def test_hashed_image_chunks_preserve_encoder_claims_and_reuse_only_matching_con
         assert req.mm_items is items and req.mrope_positions_full is positions
         assert req.mrope_delta == 5
         assert req.media is None and req.mm_embeds is None
-        jobs, plan, rows = plan_mm_batch(batch.reqs, encoder)
+        jobs, plan, rows, block_ends = plan_mm_batch(batch.reqs, encoder)
         for job in jobs:
             encoded += 1
             encoder.put(job.hash, embedding)
         expected_rows = list(range(max(1, req.cached_len) - req.cached_len,
                                    min(5, req.device_len) - req.cached_len))
         assert rows == expected_rows
+        assert block_ends == [5 if i in rows else 0 for i in range(req.extend_len)]
         for uid, h, lo, hi, _, _ in plan:
             gathered.append(encoder.get_slice(h, lo, hi, torch.device("cpu")))
             encoder.consume(h, uid, hi - lo)
@@ -130,10 +131,70 @@ def test_hashed_image_chunks_preserve_encoder_claims_and_reuse_only_matching_con
     manager.add_one_req(UserMsg(2, ids, params, mm_items=items, mrope_positions=positions, mrope_delta=5))
     [reused] = manager.schedule_next_batch(3).reqs
     assert reused.cached_len == matched_len
-    assert plan_mm_batch([reused], encoder) == ([], [], [])
+    assert plan_mm_batch([reused], encoder) == ([], [], [], [0] * reused.extend_len)
     assert encoder.stats() == (0, 0)
     cache.allocate_paged([reused])
     reused.cached_len = reused.device_len
     with cache.lazy_free_region():
         cache.cache_req(reused, finished=True)
+    cache.check_integrity()
+
+
+@pytest.mark.parametrize("cache_type", ["radix", "swa_radix"])
+def test_atomic_images_defer_after_legacy_input_without_losing_encoder_claims(cache_type):
+    encoder = EncoderCache(storage="cpu")
+    cache, manager = _manager(cache_type, encoder_cache=encoder)
+    manager.keep_images_whole = True
+    params = SamplingParams(max_tokens=1)
+    legacy_embeds = torch.arange(8).reshape(1, 8)
+    manager.add_one_req(UserMsg(1, torch.tensor([9, 5]), params, mm_embeds=legacy_embeds))
+    pad = mm_pad_value(7)
+    items = [MMItem(modality="image", hash=7, pad_value=pad, offsets=[[lo, lo + 4]], feature=torch.zeros(1))
+             for lo in (0, 4)]
+    manager.add_one_req(UserMsg(2, torch.tensor([pad] * 8 + [5, 6]), params, mm_items=items))
+    initial_tables = manager.table_manager.available_size
+    first = manager.schedule_next_batch(5)
+    assert [(req.uid, req.extend_len) for req in first.reqs] == [(1, 2)]
+    assert first.reqs[0].mm_embeds is legacy_embeds
+    assert manager.table_manager.available_size == initial_tables - 1
+    assert encoder._entries == {}
+    cache.allocate_paged(first.reqs)
+    legacy = first.reqs[0]
+    legacy.cached_len = legacy.device_len
+    with cache.lazy_free_region():
+        cache.cache_req(legacy, finished=True)
+    manager.table_manager.free(legacy.table_idx)
+
+    embedding = torch.arange(32).reshape(4, 8)
+    gathered = []
+    encoded = 0
+    while manager.runnable:
+        batch = manager.schedule_next_batch(5)
+        assert batch is not None
+        [req] = batch.reqs
+        assert req.uid == 2
+        assert all(not lo < req.device_len < hi for item in items for lo, hi in item.offsets)
+        jobs, plan, rows, block_ends = plan_mm_batch(batch.reqs, encoder)
+        for job in jobs:
+            encoded += 1
+            encoder.put(job.hash, embedding)
+            job.feature = None
+        for uid, item_hash, lo, hi, _, _ in plan:
+            gathered.append(encoder.get_slice(item_hash, lo, hi, torch.device("cpu")))
+            encoder.consume(item_hash, uid, hi - lo)
+        assert all(block_ends[row] in (4, 8) for row in rows)
+        if req.device_len < 8:
+            assert encoder.has(7)
+        cache.free_swa_out_of_window_extend([req])
+        cache.allocate_paged([req])
+        req.cached_len = req.device_len
+        if not isinstance(req, ChunkedReq):
+            with cache.lazy_free_region():
+                cache.cache_req(req, finished=True)
+            manager.table_manager.free(req.table_idx)
+
+    assert encoded == 1
+    assert torch.equal(torch.cat(gathered), embedding.repeat(2, 1))
+    assert encoder._entries == {}
+    assert manager.table_manager.available_size == initial_tables
     cache.check_integrity()

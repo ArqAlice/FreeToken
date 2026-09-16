@@ -30,6 +30,7 @@ _EXPERT_RE = re.compile(
 )
 _EXPERT_PREFIX_RE = re.compile(r"^layers\.(\d+)\.ffn\.experts\.")
 _ENGRAM_TABLE_RE = re.compile(r"^layers\.\d+\.engram\.embed\.(weight|scale)$")
+_VISION_PREFIXES = ("vision.", "aligner.", "image_")
 
 
 def _weight_map(folder):
@@ -149,7 +150,7 @@ def iter_weights(model_path, device, *, include_moe_experts=True, include_non_mo
         for name in sorted(weight_map, key=lambda name: (weight_map[name], name)):
             if name.startswith("mtp.") or _EXPERT_PREFIX_RE.match(name) or _ENGRAM_TABLE_RE.match(name):
                 continue
-            if (not include_vision or not args.vision_enabled) and name.startswith(("vision.", "aligner.", "image_")):
+            if (not include_vision or not args.vision_enabled) and name.startswith(_VISION_PREFIXES):
                 continue
             if name.endswith(".attn.wo_a.scale"):
                 continue
@@ -157,6 +158,19 @@ def iter_weights(model_path, device, *, include_moe_experts=True, include_non_mo
                 prefix = name.removesuffix(".weight")
                 yield prefix, _dequant_fp8_block(reader.get(name), reader.get(prefix + ".scale"))
             else:
+                yield name, reader.get(name)
+    finally:
+        reader.close()
+
+
+def iter_vision_weights(model_path, device):
+    """Read the native vision stack, including its learned image delimiters."""
+    folder = download_hf_weight(model_path)
+    weight_map = _weight_map(folder)
+    reader = _ShardReader(folder, weight_map, device)
+    try:
+        for name in sorted(weight_map, key=lambda name: (weight_map[name], name)):
+            if name.startswith(_VISION_PREFIXES):
                 yield name, reader.get(name)
     finally:
         reader.close()
@@ -182,5 +196,5 @@ def iter_expert_pieces(model_path, config, kind, *, parallel=False, workers=8, c
                                     workers=workers, chunk=chunk, drop_page_cache=drop_page_cache)
 
 
-__all__ = ["iter_weights", "is_expert_tensor", "iter_expert_pieces",
+__all__ = ["iter_weights", "iter_vision_weights", "is_expert_tensor", "iter_expert_pieces",
            "read_checkpoint_headers", "validate_expert_headers"]

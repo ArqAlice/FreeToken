@@ -6,7 +6,7 @@ _EXPORTS = {
     "DeepseekV41Args": "args", "load_args": "args", "parse_config": "config",
     "checkpoint_quant_config": "config", "DeepseekV41QuantConfig": "config",
     "DeepseekV41ForCausalLM": "model", "iter_weights": "weight",
-    "iter_expert_pieces": "weight",
+    "iter_expert_pieces": "weight", "iter_vision_weights": "weight",
     "is_expert_tensor": "weight",
 }
 

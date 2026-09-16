@@ -166,6 +166,7 @@ class TritonAttentionBackend(BaseAttnBackend):
         assert (k_scale is None) == (v_scale is None), "K and V scales come as a pair"
 
         spec = attn_spec or AttentionSpec()
+        block_ends = batch.mm_block_ends if spec.bidirectional_mm_blocks else None
         indices = metadata.indices
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
@@ -220,7 +221,10 @@ class TritonAttentionBackend(BaseAttnBackend):
                 kv_quant=kv_quant,
                 k_block_scale=k_block_scale,
                 v_block_scale=v_block_scale,
+                block_ends=block_ends,
             )
+        if block_ends is not None:
+            raise NotImplementedError("bidirectional multimodal blocks need the extend kernel path")
         return paged_attention(
             q=q,
             k_cache=k_cache,

@@ -223,9 +223,10 @@ def _run_engine_smoke(folder, port, kv_quant, image_path):
         batch.active_table_idx = torch.tensor([0], dtype=torch.long, device="cuda")
         batch.out_loc = engine.page_table[0, req.cached_len:req.device_len]
         if phase == "prefill" and req.mm_items:
-            jobs, plan, rows = plan_mm_batch([req], engine.encoder_cache)
+            jobs, plan, rows, block_ends = plan_mm_batch([req], engine.encoder_cache)
             batch.mm_encoder_jobs, batch.mm_gather_plan = jobs, plan
             batch.mm_rows = torch.tensor(rows, device="cuda", dtype=torch.long)
+            batch.mm_block_ends = torch.tensor(block_ends, device="cuda", dtype=torch.int32)
         engine.attn_backend.prepare_metadata(batch)
         with torch.inference_mode():
             output = engine.forward_batch(batch, engine.sampler.prepare(batch))
